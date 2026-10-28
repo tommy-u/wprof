@@ -5838,6 +5838,7 @@ int emit_trace(struct worker_state *w)
 		js.out.options = (struct json_options) {
 			.no_batching = env.json_no_batching,
 			.no_int_format = env.json_no_int_format,
+			.no_int_ts = env.json_no_int_ts,
 		};
 		json_init(&js);
 		emit_header_json(w);

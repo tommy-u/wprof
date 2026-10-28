@@ -232,6 +232,7 @@ struct env {
 	bool pb_disable_interns;
 	bool json_no_batching;
 	bool json_no_int_format;
+	bool json_no_int_ts;
 	bool keep_workdir;
 	bool raw_stacks;
 	bool no_tsidx;		/* replay: ignore the timestamp index, force full walk */

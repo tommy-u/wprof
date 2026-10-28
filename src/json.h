@@ -14,6 +14,7 @@ enum json_scope {
 struct json_options {
 	bool no_batching;
 	bool no_int_format;
+	bool no_int_ts;
 };
 
 struct json_buf {
@@ -148,6 +149,26 @@ static inline void json_float(struct json_buf *b, const char *fmt, double value)
 	if (n < 0 || (size_t)n >= sizeof(buf))
 		BUG("Invalid JSON float format\n");
 	json_write(b, buf, n);
+}
+
+static inline void json_ts(struct json_buf *b, u64 ns)
+{
+	/* Below 2^22 seconds, double division error is less than half a nanosecond,
+	 * so %.9lf rounds back to ns with the default rounding mode and C locale.
+	 */
+	if (b->options.no_int_ts || ns >= (1ULL << 22) * 1000000000ULL) {
+		json_float(b, "%.9lf", ns / 1e9);
+		return;
+	}
+	json_uint(b, ns / 1000000000ULL);
+	char frac[10] = { '.' };
+	u64 remainder = ns % 1000000000ULL;
+
+	for (int i = 9; i > 0; i--) {
+		frac[i] = '0' + remainder % 10;
+		remainder /= 10;
+	}
+	json_write(b, frac, sizeof(frac));
 }
 
 static inline void json_escape(struct json_buf *b, unsigned char c)
@@ -354,7 +375,8 @@ static inline void json_kv_float(struct json_state *js, const char *key, const c
 
 static inline void json_kv_ts(struct json_state *js, const char *key, u64 ns)
 {
-	json_kv_float(js, key, "%.9lf", ns / 1e9);
+	json_key(js, key);
+	json_ts(&js->out, ns);
 }
 
 static inline void json_kv_bool(struct json_state *js, const char *key, bool value)
