@@ -21,7 +21,48 @@ REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
 
 
+JSON_OPTIMIZATIONS = (
+    'buffering',
+)
+
+
+JSON_DEBUG_FEATURES = (
+    'json-no-batching',
+)
+
+
 class JsonOptionsTest(unittest.TestCase):
+    def test_json_debug_features_are_accepted(self):
+        for feature in JSON_DEBUG_FEATURES:
+            with self.subTest(feature=feature):
+                result = subprocess.run(
+                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--debug", feature],
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b"Unrecognized debug feature", result.stderr)
+                self.assertIn(b"/missing-json-test.data", result.stderr)
+
+    def test_unknown_json_optimization_is_rejected(self):
+        for flag in ("--json-opt", "--no-json-opt"):
+            with self.subTest(flag=flag):
+                result = subprocess.run([str(WPROF), flag, "unknown"], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Unknown JSON optimization 'unknown'", result.stderr)
+                self.assertIn(flag.encode(), result.stderr)
+
+    def test_json_optimization_controls_are_accepted(self):
+        for flag in ("--json-opt", "--no-json-opt"):
+            for name in (*JSON_OPTIMIZATIONS, "all"):
+                with self.subTest(flag=flag, name=name):
+                    result = subprocess.run(
+                        [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", flag, name],
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(b"Unknown JSON optimization", result.stderr)
+                    self.assertIn(b"/missing-json-test.data", result.stderr)
+
     def test_removed_mode_and_tuning_flags_are_rejected(self):
         for flags in (("--fast-json",), ("--json-workers", "4"), ("--json-batch-size", "1mb")):
             with self.subTest(flags=flags):
@@ -40,6 +81,40 @@ class JsonOptionsTest(unittest.TestCase):
 
 
 class JsonWriterTest(unittest.TestCase):
+    def test_debug_combinations_match_reference_bytes(self):
+        checked = 0
+        for mask in range(1 << len(JSON_DEBUG_FEATURES)):
+            features = [feature for bit, feature in enumerate(JSON_DEBUG_FEATURES) if mask & (1 << bit)]
+            if "json-no-parallel" in JSON_DEBUG_FEATURES and "json-no-batching" in features and "json-no-parallel" not in features:
+                continue
+            flags = [arg for feature in features for arg in ("--debug", feature)]
+            with self.subTest(features=features):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags])
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags])
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, reference)
+                self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
+                checked += 1
+        self.assertGreater(checked, 0)
+        print(f"Verified {checked} debug combinations, SHA-256 {REFERENCE_SHA256}")
+
+    def test_named_optimization_controls_match_reference_bytes(self):
+        settings = [["--no-json-opt", name] for name in JSON_OPTIMIZATIONS]
+        settings.extend((
+            ["--no-json-opt", "all"],
+            ["--no-json-opt", "all", "--json-opt", "all"],
+            ["--json-opt", "all", "--no-json-opt", "all"],
+            ["--debug", "json-no-batching", "--json-opt", "buffering"],
+            ["--json-opt", "buffering", "--debug", "json-no-batching"],
+        ))
+        for flags in settings:
+            with self.subTest(flags=flags):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, reference)
+                self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="wprof-json-reference-test-")

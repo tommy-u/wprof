@@ -113,6 +113,8 @@ enum {
 	OPT_JSON_SCHEMA = 1018,
 	OPT_PREPARE = 1019,
 	OPT_ACTIVATE = 1020,
+	OPT_JSON_OPT = 1024,
+	OPT_NO_JSON_OPT = 1025,
 
 	OPT_ALLOW_TID = 2000,
 	OPT_DENY_TID = 2001,
@@ -145,10 +147,34 @@ static const struct {
 	{ "uprobe-args", SEAL_UPROBE_ARGS },
 };
 
+static const struct {
+	const char *name;
+	bool *value;
+	bool enabled_value;
+} json_optimizations[] = {
+	{ "buffering", &env.json_no_batching, false },
+};
+
+static int set_json_optimization(const char *name, bool enabled)
+{
+	bool all = strcasecmp(name, "all") == 0;
+
+	for (size_t i = 0; i < sizeof(json_optimizations) / sizeof(json_optimizations[0]); i++) {
+		if (all || strcasecmp(name, json_optimizations[i].name) == 0) {
+			*json_optimizations[i].value = enabled ? json_optimizations[i].enabled_value : !json_optimizations[i].enabled_value;
+			if (!all)
+				return 0;
+		}
+	}
+	return all ? 0 : -EINVAL;
+}
+
 static const struct argp_option opts[] = {
 	{ "verbose", 'v', NULL, 0, "Verbose output" },
 	{ "stats", OPT_STATS, NULL, 0, "Print various wprof stats (BPF, resource usage, etc.)" },
-	{ "debug", OPT_DEBUG, "FEAT", 0, "Debug features (pb-debug-interns, pb-disable-interns, keep-workdir, raw-stacks, no-tsidx, no-task-storage, fr-chunk-size=SIZE)"},
+	{ "debug", OPT_DEBUG, "FEAT", 0,
+	  "Debug features (pb-debug-interns, pb-disable-interns, json-no-batching, "
+	  "keep-workdir, raw-stacks, no-tsidx, no-task-storage, fr-chunk-size=SIZE)" },
 	{ "log", OPT_LOG, "LOG", 0, "Debug logging subset selector (libbpf, usdt, topology, inject, tracee, discovery)"},
 	{ "dur", 'd', "DURATION", 0, "Limit running duration; accepts time units s/ms/us/ns/m/h, bare number is ms (default: 1000ms)" },
 	{ "dur-ms", 0, 0, OPTION_ALIAS },
@@ -164,6 +190,9 @@ static const struct argp_option opts[] = {
 	{ "data", 'D', "FILE", 0, "Data dump path (defaults to 'wprof.data' in current directory)" },
 	{ "trace", 'T', "FILE", 0, "Emit Perfetto trace to specified file (use '-' for stdout)" },
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
+	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
+	  "Enable JSON optimization: buffering, all (last setting wins)" },
+	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 
 	{ "record", OPT_RECORD, NULL, 0, "Record mode (default, mutually exclusive with --replay)" },
@@ -291,6 +320,8 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			env.pb_debug_interns = true;
 		} else if (strcasecmp(arg, "pb-disable-interns") == 0) {
 			env.pb_disable_interns = true;
+		} else if (strcasecmp(arg, "json-no-batching") == 0) {
+			env.json_no_batching = true;
 		} else if (strcasecmp(arg, "keep-workdir") == 0) {
 			env.keep_workdir = true;
 		} else if (strcasecmp(arg, "raw-stacks") == 0) {
@@ -461,6 +492,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return -EINVAL;
 		}
 		env.json_path = strdup(arg);
+		break;
+	case OPT_JSON_OPT:
+	case OPT_NO_JSON_OPT:
+		if (set_json_optimization(arg, key == OPT_JSON_OPT)) {
+			eprintf("Unknown JSON optimization '%s' for --%s\n", arg,
+				key == OPT_JSON_OPT ? "json-opt" : "no-json-opt");
+			return -EINVAL;
+		}
 		break;
 	case OPT_JSON_SCHEMA: {
 		extern const char json_schema_start[];

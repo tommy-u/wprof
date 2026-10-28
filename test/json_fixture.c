@@ -10,6 +10,7 @@
 
 typedef uint64_t u64;
 #define __unused __attribute__((unused))
+#define BUG(...) abort()
 
 #ifdef JSON_REFERENCE
 #include "json_reference.h"
@@ -19,11 +20,52 @@ typedef uint64_t u64;
 
 int main(int argc, char **argv)
 {
-	bool empty = argc == 2 && strcmp(argv[1], "--empty") == 0;
+	const char *features[] = { "json-no-batching" };
+	const char *optimizations[] = { "buffering" };
+	const size_t debug_optimization[] = { 0 };
+	bool disabled[1] = { false };
+	bool empty = false;
 
-	if (argc > 2 || (argc == 2 && !empty))
-		return 2;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--empty") == 0) {
+			empty = true;
+		} else if ((strcmp(argv[i], "--json-opt") == 0 || strcmp(argv[i], "--no-json-opt") == 0) && i + 1 < argc) {
+			bool disable = strcmp(argv[i], "--no-json-opt") == 0;
+			const char *name = argv[++i];
+			size_t optimization = 0;
+
+			if (strcmp(name, "all") == 0) {
+				for (size_t j = 0; j < 1; j++)
+					disabled[j] = disable;
+				continue;
+			}
+			while (optimization < 1 && strcmp(name, optimizations[optimization]) != 0)
+				optimization++;
+			if (optimization == 1)
+				return 2;
+			disabled[optimization] = disable;
+		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
+			const char *name = argv[++i];
+			size_t feature = 0;
+
+			while (feature < 1 && strcmp(name, features[feature]) != 0)
+				feature++;
+			if (feature == 1)
+				return 2;
+			disabled[debug_optimization[feature]] = true;
+		} else {
+			return 2;
+		}
+	}
 	struct json_state js = JSON_STATE_INIT(stdout);
+#ifndef JSON_REFERENCE
+	js.out.options = (struct json_options) {
+		.no_batching = disabled[0],
+	};
+	json_init(&js);
+#else
+	(void)disabled;
+#endif
 
 	if (!empty) {
 		char reused[32] = "original";
@@ -180,5 +222,8 @@ int main(int argc, char **argv)
 		json_obj_end(&js);
 	}
 
+#ifndef JSON_REFERENCE
+	json_finish(&js);
+#endif
 	return fflush(stdout) || ferror(stdout) ? 1 : 0;
 }
