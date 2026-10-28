@@ -13,15 +13,42 @@ enum json_scope {
 	JSON_ARR,
 };
 
+/* Batches contain ASCII syntax and complete typed tokens with native-endian
+ * payloads. Strings are copied immediately, including their NUL terminator;
+ * float format pointers refer to static literals.
+ */
+enum json_token {
+	JSON_TOKEN_INT = 0x80,
+	JSON_TOKEN_UINT = 0x81,
+	JSON_TOKEN_FLOAT = 0x82,
+	JSON_TOKEN_TS = 0x83,
+	JSON_TOKEN_STRING = 0x84,
+	JSON_TOKEN_KEY = 0x85,
+	JSON_TOKEN_KEY_COMMA = 0x86,
+	JSON_TOKEN_QUOTED = 0x87,
+	JSON_TOKEN_RAW = 0x90,
+};
+
 struct json_state {
 	FILE *f;
 	struct sbuf out;
+	bool deferred;
+	char *batch;
+	size_t batch_len;
+	size_t batch_capacity;
 	int lvl;
 	enum json_scope scope[5];
 	int cnt[5]; /* comma tracking per level */
 };
 
+struct json_job {
+	char *batch;
+	size_t batch_len;
+	struct sbuf out;
+};
+
 #define JSON_STATE_INIT(file) { .f = (file), .lvl = -1 }
+#define JSON_BUF_SZ (1024 * 1024)
 
 static inline void json_frag_start(struct json_state *js)
 {
@@ -43,19 +70,16 @@ static inline void json_flush(struct json_state *js)
 	sbuf_reset(&js->out);
 }
 
-static inline void json_finish(struct json_state *js)
-{
-	sbuf_free(&js->out);
-}
-
 static inline void json_write(struct json_state *js, const void *p, size_t n)
 {
 	sbuf_append(&js->out, p, n);
 }
 
+static inline void json_fragment(struct json_state *js, const void *data, size_t len);
+
 static inline void json_raw(struct json_state *js, const struct sbuf *fragment)
 {
-	json_write(js, fragment->buf, fragment->len);
+	json_fragment(js, fragment->buf, fragment->len);
 }
 
 static inline void json_putc(struct json_state *js, char c)
@@ -236,7 +260,7 @@ static inline int json_utf8_seq_len(const unsigned char *p)
  * arbitrary byte content (e.g. utrace buffers or metadata with quotes or
  * newlines) can never produce undecodable output.
  */
-static inline void json_puts(struct json_state *js, const char *s)
+static inline const char *json_puts(struct json_state *js, const char *s)
 {
 	const unsigned char *p = (const unsigned char *)s;
 
@@ -250,7 +274,7 @@ static inline void json_puts(struct json_state *js, const char *s)
 
 		unsigned char c = *p;
 		switch (c) {
-		case 0: return;
+		case 0: return (const char *)p;
 		case '"':  json_write(js, "\\\"", 2); p++; break;
 		case '\\': json_write(js, "\\\\", 2); p++; break;
 		case '\n': json_write(js, "\\n", 2); p++; break;
@@ -275,23 +299,276 @@ static inline void json_puts(struct json_state *js, const char *s)
 			}
 		}
 	}
+	return (const char *)p;
+}
+
+static inline const char *json_putquoted(struct json_state *js, const char *s)
+{
+	json_putc(js, '"');
+	const char *end = json_puts(js, s);
+	json_putc(js, '"');
+	return end;
+}
+
+static inline const char *json_putkey(struct json_state *js, const char *key, bool comma)
+{
+	if (comma)
+		json_putc(js, ',');
+	json_putc(js, '"');
+	const char *end = json_puts(js, key);
+	json_write(js, "\":", 2);
+	return end;
+}
+
+/* Payloads are native-endian and unaligned; copied strings include their NUL terminator. */
+static inline void json_render(struct json_state *js, const char *data, size_t len)
+{
+	const unsigned char *p = (const unsigned char *)data;
+	const unsigned char *end = p + len;
+
+	sbuf_ensure(&js->out, JSON_BUF_SZ);
+	while (p < end) {
+		unsigned char token = *p;
+		p++;
+
+		switch (token) {
+		case JSON_TOKEN_INT: {
+			long long value;
+
+			memcpy(&value, p, sizeof(value));
+			p += sizeof(value);
+			json_int(js, value);
+			break;
+		}
+		case JSON_TOKEN_UINT: {
+			unsigned long long value;
+
+			memcpy(&value, p, sizeof(value));
+			p += sizeof(value);
+			json_uint(js, value);
+			break;
+		}
+		case JSON_TOKEN_FLOAT: {
+			const char *fmt;
+			double value;
+
+			memcpy(&fmt, p, sizeof(fmt));
+			p += sizeof(fmt);
+			memcpy(&value, p, sizeof(value));
+			p += sizeof(value);
+			json_float(js, fmt, value);
+			break;
+		}
+		case JSON_TOKEN_TS: {
+			u64 ns;
+
+			memcpy(&ns, p, sizeof(ns));
+			p += sizeof(ns);
+			json_ts(js, ns);
+			break;
+		}
+		case JSON_TOKEN_STRING:
+			p = (const unsigned char *)json_puts(js, (const char *)p) + 1;
+			break;
+		case JSON_TOKEN_KEY:
+		case JSON_TOKEN_KEY_COMMA:
+			p = (const unsigned char *)json_putkey(js, (const char *)p, token == JSON_TOKEN_KEY_COMMA) + 1;
+			break;
+		case JSON_TOKEN_QUOTED:
+			p = (const unsigned char *)json_putquoted(js, (const char *)p) + 1;
+			break;
+		case JSON_TOKEN_RAW: {
+			size_t n;
+
+			memcpy(&n, p, sizeof(n));
+			p += sizeof(n);
+			json_write(js, p, n);
+			p += n;
+			break;
+		}
+		default:
+			json_putc(js, token);
+		}
+	}
+}
+
+static inline void json_work(void *ctx, void *ptr)
+{
+	struct json_job *job = ptr;
+
+	(void)ctx;
+	struct json_state render = JSON_STATE_INIT(NULL);
+
+	json_render(&render, job->batch, job->batch_len);
+	job->out = render.out;
+}
+
+static inline void json_done(void *ctx, void *ptr)
+{
+	struct json_job *job = ptr;
+	FILE *f = ctx;
+
+	fwrite(job->out.buf, 1, job->out.len, f);
+	free(job->batch);
+	sbuf_free(&job->out);
+	free(job);
+}
+
+static inline void json_submit(struct json_state *js)
+{
+	if (!js->batch_len)
+		return;
+	struct json_job *job = malloc(sizeof(*job));
+
+	*job = (struct json_job) { .batch = js->batch, .batch_len = js->batch_len };
+	js->batch = NULL;
+	js->batch_len = 0;
+	js->batch_capacity = 0;
+	json_work(js->f, job);
+	json_done(js->f, job);
+}
+
+static inline char *json_token_reserve(struct json_state *js, size_t n)
+{
+	if (n > js->batch_capacity - js->batch_len)
+		json_submit(js);
+	if (n > js->batch_capacity) {
+		size_t capacity = n > JSON_BUF_SZ ? n : JSON_BUF_SZ;
+
+		js->batch = realloc(js->batch, capacity);
+		js->batch_capacity = capacity;
+	}
+	char *p = js->batch + js->batch_len;
+
+	js->batch_len += n;
+	return p;
+}
+
+static inline void json_token_data(struct json_state *js, enum json_token token, const void *data, size_t n)
+{
+	char *p = json_token_reserve(js, 1 + n);
+
+	*p = token;
+	p++;
+	memcpy(p, data, n);
+}
+
+/* Cached fragments may contain UTF-8 bytes that overlap token IDs. */
+static inline void json_fragment(struct json_state *js, const void *data, size_t n)
+{
+	if (js->deferred) {
+		char *p = json_token_reserve(js, 1 + sizeof(n) + n);
+
+		*p = JSON_TOKEN_RAW;
+		p++;
+		memcpy(p, &n, sizeof(n));
+		p += sizeof(n);
+		memcpy(p, data, n);
+	} else {
+		json_write(js, data, n);
+	}
+}
+
+static inline void json_token_string(struct json_state *js, enum json_token token, const char *s)
+{
+	json_token_data(js, token, s, strlen(s) + 1);
+}
+
+static inline void json_literal(struct json_state *js, const char *s, size_t n)
+{
+	if (js->deferred)
+		memcpy(json_token_reserve(js, n), s, n);
+	else
+		json_write(js, s, n);
+}
+
+static inline void json_char(struct json_state *js, char c)
+{
+	if (js->deferred)
+		*json_token_reserve(js, 1) = c;
+	else
+		json_putc(js, c);
+}
+
+static inline void json_string(struct json_state *js, const char *s, bool quoted)
+{
+	if (js->deferred)
+		json_token_string(js, quoted ? JSON_TOKEN_QUOTED : JSON_TOKEN_STRING, s);
+	else if (quoted)
+		json_putquoted(js, s);
+	else
+		json_puts(js, s);
+}
+
+static inline void json_value_int(struct json_state *js, long long value)
+{
+	if (js->deferred)
+		json_token_data(js, JSON_TOKEN_INT, &value, sizeof(value));
+	else
+		json_int(js, value);
+}
+
+static inline void json_value_uint(struct json_state *js, unsigned long long value)
+{
+	if (js->deferred)
+		json_token_data(js, JSON_TOKEN_UINT, &value, sizeof(value));
+	else
+		json_uint(js, value);
+}
+
+static inline void json_value_float(struct json_state *js, const char *fmt, double value)
+{
+	if (js->deferred) {
+		char *p = json_token_reserve(js, 1 + sizeof(fmt) + sizeof(value));
+
+		*p = JSON_TOKEN_FLOAT;
+		p++;
+		memcpy(p, &fmt, sizeof(fmt));
+		memcpy(p + sizeof(fmt), &value, sizeof(value));
+	} else {
+		json_float(js, fmt, value);
+	}
+}
+
+static inline void json_value_ts(struct json_state *js, u64 ns)
+{
+	if (js->deferred)
+		json_token_data(js, JSON_TOKEN_TS, &ns, sizeof(ns));
+	else
+		json_ts(js, ns);
+}
+
+static inline void json_init(struct json_state *js)
+{
+	js->deferred = true;
+	js->batch = malloc(JSON_BUF_SZ);
+	js->batch_capacity = JSON_BUF_SZ;
+}
+
+static inline void json_finish(struct json_state *js)
+{
+	if (js->deferred) {
+		json_submit(js);
+		free(js->batch);
+	} else if (js->out.len) {
+		json_flush(js);
+	}
+	sbuf_free(&js->out);
 }
 
 static inline void json_str(struct json_state *js, const char *value)
 {
-	json_putc(js, '"');
-	json_puts(js, value);
-	json_putc(js, '"');
+	json_string(js, value, true);
 }
 
 static inline void json_bool(struct json_state *js, bool value)
 {
-	json_write(js, value ? "true" : "false", value ? 4 : 5);
+	json_literal(js, value ? "true" : "false", value ? 4 : 5);
 }
 
 static inline void json_null(struct json_state *js)
 {
-	json_write(js, "null", 4);
+	json_literal(js, "null", 4);
 }
 
 static inline void json_vprintf(struct json_state *js, const char *fmt, va_list ap)
@@ -306,12 +583,12 @@ static inline void json_vprintf(struct json_state *js, const char *fmt, va_list 
 		return;
 	}
 	if ((size_t)n < sizeof(buf)) {
-		json_puts(js, buf);
+		json_string(js, buf, false);
 	} else {
 		char *heap = malloc(n + 1);
 
 		vsnprintf(heap, n + 1, fmt, ap2);
-		json_puts(js, heap);
+		json_string(js, heap, false);
 		free(heap);
 	}
 	va_end(ap2);
@@ -320,14 +597,14 @@ static inline void json_vprintf(struct json_state *js, const char *fmt, va_list 
 __attribute__((format(printf, 2, 3)))
 static inline void json_fmt(struct json_state *js, const char *fmt, ...)
 {
-	json_putc(js, '"');
+	json_char(js, '"');
 
 	va_list ap;
 	va_start(ap, fmt);
 	json_vprintf(js, fmt, ap);
 	va_end(ap);
 
-	json_putc(js, '"');
+	json_char(js, '"');
 }
 
 static inline void json_obj_start(struct json_state *js)
@@ -335,7 +612,7 @@ static inline void json_obj_start(struct json_state *js)
 	++js->lvl;
 	js->scope[js->lvl] = JSON_OBJ;
 	js->cnt[js->lvl] = 0;
-	json_putc(js, '{');
+	json_char(js, '{');
 }
 
 static inline void json_obj_end(struct json_state *js)
@@ -343,49 +620,105 @@ static inline void json_obj_end(struct json_state *js)
 	js->cnt[js->lvl] = 0;
 	js->lvl--;
 	if (js->lvl < 0) { /* outermost level, emit newline */
-		json_write(js, "}\n", 2);
-		json_flush(js);
+		json_literal(js, "}\n", 2);
+		if (!js->deferred && js->f)
+			json_flush(js);
 	} else
-		json_putc(js, '}');
+		json_char(js, '}');
 }
 
 static inline void json_key(struct json_state *js, const char *key)
 {
-	if (js->cnt[js->lvl])
-		json_putc(js, ',');
-	json_putc(js, '"');
-	json_puts(js, key);
-	json_write(js, "\":", 2);
+	if (js->deferred)
+		json_token_string(js, js->cnt[js->lvl] ? JSON_TOKEN_KEY_COMMA : JSON_TOKEN_KEY, key);
+	else
+		json_putkey(js, key, js->cnt[js->lvl]);
 	js->cnt[js->lvl]++;
 }
 
 static inline void json_literal_field(struct json_state *js, const char *text, size_t len)
 {
 	if (js->cnt[js->lvl])
-		json_putc(js, ',');
-	json_write(js, text, len);
+		json_char(js, ',');
+	json_literal(js, text, len);
 	js->cnt[js->lvl]++;
+}
+
+static inline void json_kv_str(struct json_state *js, const char *key, const char *value)
+{
+	json_key(js, key);
+	json_string(js, value, true);
+}
+
+__attribute__((format(printf, 3, 4)))
+static inline void json_kv_fmt(struct json_state *js, const char *key, const char *fmt, ...)
+{
+	json_key(js, key);
+	json_char(js, '"');
+
+	va_list ap;
+	va_start(ap, fmt);
+	json_vprintf(js, fmt, ap);
+	va_end(ap);
+
+	json_char(js, '"');
+}
+
+static inline void json_kv_int(struct json_state *js, const char *key, long long value)
+{
+	json_key(js, key);
+	json_value_int(js, value);
+}
+
+static inline void json_kv_uint(struct json_state *js, const char *key, unsigned long long value)
+{
+	json_key(js, key);
+	json_value_uint(js, value);
+}
+
+static inline void json_kv_null(struct json_state *js, const char *key)
+{
+	json_key(js, key);
+	json_literal(js, "null", 4);
+}
+
+static inline void json_kv_float(struct json_state *js, const char *key, const char *fmt, double value)
+{
+	json_key(js, key);
+	json_value_float(js, fmt, value);
+}
+
+static inline void json_kv_ts(struct json_state *js, const char *key, u64 ns)
+{
+	json_key(js, key);
+	json_value_ts(js, ns);
+}
+
+static inline void json_kv_bool(struct json_state *js, const char *key, bool value)
+{
+	json_key(js, key);
+	json_literal(js, value ? "true" : "false", value ? 4 : 5);
 }
 
 #define json_key_literal(js, key) \
 	json_literal_field(js, "\"" key "\":", sizeof("\"" key "\":") - 1)
 #define json_kv_const_str(js, key, value) \
 	json_literal_field(js, "\"" key "\":\"" value "\"", sizeof("\"" key "\":\"" value "\"") - 1)
-#define json_kv_int(js, key, value) \
-	do { json_key_literal(js, key); json_int(js, value); } while (0)
-#define json_kv_ts(js, key, value) \
-	do { json_key_literal(js, key); json_ts(js, value); } while (0)
-#define json_kv_str(js, key, value) \
+#define json_kv_int_literal(js, key, value) \
+	do { json_key_literal(js, key); json_value_int(js, value); } while (0)
+#define json_kv_ts_literal(js, key, value) \
+	do { json_key_literal(js, key); json_value_ts(js, value); } while (0)
+#define json_kv_str_literal(js, key, value) \
 	do { json_key_literal(js, key); json_str(js, value); } while (0)
-#define json_kv_bool(js, key, value) \
+#define json_kv_bool_literal(js, key, value) \
 	do { json_key_literal(js, key); json_bool(js, value); } while (0)
-#define json_kv_float(js, key, fmt, value) \
-	do { json_key_literal(js, key); json_float(js, fmt, value); } while (0)
-#define json_kv_fmt(js, key, ...) \
+#define json_kv_float_literal(js, key, fmt, value) \
+	do { json_key_literal(js, key); json_value_float(js, fmt, value); } while (0)
+#define json_kv_fmt_literal(js, key, ...) \
 	do { json_key_literal(js, key); json_fmt(js, __VA_ARGS__); } while (0)
-#define json_subarr_start(js, key) \
+#define json_subarr_start_literal(js, key) \
 	do { json_key_literal(js, key); json_arr_start(js); } while (0)
-#define json_subobj_start(js, key) \
+#define json_subobj_start_literal(js, key) \
 	do { json_key_literal(js, key); json_obj_start(js); } while (0)
 
 static inline void json_arr_start(struct json_state *js)
@@ -393,20 +726,20 @@ static inline void json_arr_start(struct json_state *js)
 	++js->lvl;
 	js->scope[js->lvl] = JSON_ARR;
 	js->cnt[js->lvl] = 0;
-	json_putc(js, '[');
+	json_char(js, '[');
 }
 
 static inline void json_arr_end(struct json_state *js)
 {
 	js->cnt[js->lvl] = 0;
 	js->lvl--;
-	json_putc(js, ']');
+	json_char(js, ']');
 }
 
 static inline void json_arr_elem(struct json_state *js)
 {
 	if (js->cnt[js->lvl])
-		json_putc(js, ',');
+		json_char(js, ',');
 	js->cnt[js->lvl]++;
 }
 
@@ -419,25 +752,39 @@ static inline void json_arr_raw(struct json_state *js, const struct sbuf *fragme
 static inline void json_arr_str(struct json_state *js, const char *value)
 {
 	json_arr_elem(js);
-	json_str(js, value);
+	json_string(js, value, true);
+}
+
+__attribute__((format(printf, 2, 3)))
+static inline void json_arr_fmt(struct json_state *js, const char *fmt, ...)
+{
+	json_arr_elem(js);
+	json_char(js, '"');
+
+	va_list ap;
+	va_start(ap, fmt);
+	json_vprintf(js, fmt, ap);
+	va_end(ap);
+
+	json_char(js, '"');
 }
 
 __unused
 static inline void json_arr_int(struct json_state *js, long long value)
 {
 	json_arr_elem(js);
-	json_int(js, value);
+	json_value_int(js, value);
 }
 
 static inline void json_arr_float(struct json_state *js, const char *fmt, double value)
 {
 	json_arr_elem(js);
-	json_float(js, fmt, value);
+	json_value_float(js, fmt, value);
 }
 
 __unused
 static inline void json_arr_null(struct json_state *js)
 {
 	json_arr_elem(js);
-	json_null(js);
+	json_literal(js, "null", 4);
 }
