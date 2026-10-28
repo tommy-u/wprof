@@ -5840,6 +5840,7 @@ int emit_trace(struct worker_state *w)
 			.no_int_format = env.json_no_int_format,
 			.no_int_ts = env.json_no_int_ts,
 		};
+		js.no_parallel = env.json_no_parallel;
 		json_init(&js);
 		emit_header_json(w);
 		if (env.requested_stack_traces)

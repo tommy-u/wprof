@@ -22,12 +22,12 @@ REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d
 
 
 JSON_OPTIMIZATIONS = (
-    'buffering', 'integers', 'timestamps',
+    'buffering', 'integers', 'timestamps', 'parallel',
 )
 
 
 JSON_DEBUG_FEATURES = (
-    'json-no-batching', 'json-no-int-format', 'json-no-int-ts',
+    'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel',
 )
 
 
@@ -104,8 +104,8 @@ class JsonWriterTest(unittest.TestCase):
             ["--no-json-opt", "all"],
             ["--no-json-opt", "all", "--json-opt", "all"],
             ["--json-opt", "all", "--no-json-opt", "all"],
-            ["--debug", "json-no-batching", "--json-opt", "buffering"],
-            ["--json-opt", "buffering", "--debug", "json-no-batching"],
+            ["--debug", "json-no-parallel", "--json-opt", "parallel"],
+            ["--json-opt", "parallel", "--debug", "json-no-parallel"],
         ))
         for flags in settings:
             with self.subTest(flags=flags):

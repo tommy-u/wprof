@@ -57,4 +57,20 @@ size_t wppq_len(const struct wppq *pq);
 uint64_t wppq_peek_key(const struct wppq *pq);  /* min key; requires non-empty */
 void *wppq_pop(struct wppq *pq);                 /* min value, or NULL if empty */
 
+/* ==================== ORDERED WORKER POOL ==================== */
+struct wpool;
+typedef void (*wpool_work_fn)(void *ctx, void *job);
+typedef void (*wpool_done_fn)(void *ctx, void *job);
+
+/* Uses min(available CPUs, max_workers); NULL selects serial work below two.
+ * One caller submits/finishes. Each job transfers to work, then to done.
+ * work runs on a worker with exclusive job access; shared ctx access must be
+ * thread-safe. done runs on the caller in submission order and may free the
+ * job. Keep ctx valid through finish. Callbacks must not reenter this pool.
+ */
+struct wpool *wpool_new(size_t max_workers, wpool_work_fn work, wpool_done_fn done, void *ctx);
+void wpool_submit(struct wpool *pool, void *job);
+/* Closes, drains, joins and frees the pool before ctx may be freed. NULL is valid. */
+void wpool_finish(struct wpool *pool);
+
 #endif /* __WRUST_H_ */
