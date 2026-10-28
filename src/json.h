@@ -1,3 +1,5 @@
+#include "wrust.h"
+
 /*
  * LOW-LEVEL JSON BUILDER PRIMITIVES
  *
@@ -41,7 +43,7 @@ struct json_job {
 
 struct json_state {
 	struct json_buf out;
-	bool deferred;
+	struct wpool *pool;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -347,8 +349,7 @@ static inline void json_submit(struct json_state *js)
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
-	json_work(js->out.f, job);
-	json_done(js->out.f, job);
+	wpool_submit(js->pool, job);
 }
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
@@ -382,7 +383,7 @@ static inline void json_token_string(struct json_state *js, enum json_token toke
 
 static inline void json_literal(struct json_state *js, const char *s, size_t n)
 {
-	if (js->deferred)
+	if (js->pool)
 		memcpy(json_token_reserve(js, n), s, n);
 	else
 		json_write(&js->out, s, n);
@@ -390,7 +391,7 @@ static inline void json_literal(struct json_state *js, const char *s, size_t n)
 
 static inline void json_char(struct json_state *js, char c)
 {
-	if (js->deferred)
+	if (js->pool)
 		*json_token_reserve(js, 1) = c;
 	else
 		json_putc(&js->out, c);
@@ -398,7 +399,7 @@ static inline void json_char(struct json_state *js, char c)
 
 static inline void json_string(struct json_state *js, const char *s, bool quoted)
 {
-	if (js->deferred)
+	if (js->pool)
 		json_token_string(js, quoted ? JSON_TOKEN_QUOTED : JSON_TOKEN_STRING, s);
 	else if (quoted)
 		json_putquoted(&js->out, s);
@@ -408,7 +409,7 @@ static inline void json_string(struct json_state *js, const char *s, bool quoted
 
 static inline void json_value_int(struct json_state *js, long long value)
 {
-	if (js->deferred)
+	if (js->pool)
 		json_token_data(js, JSON_TOKEN_INT, &value, sizeof(value));
 	else
 		json_int(&js->out, value);
@@ -416,7 +417,7 @@ static inline void json_value_int(struct json_state *js, long long value)
 
 static inline void json_value_uint(struct json_state *js, unsigned long long value)
 {
-	if (js->deferred)
+	if (js->pool)
 		json_token_data(js, JSON_TOKEN_UINT, &value, sizeof(value));
 	else
 		json_uint(&js->out, value);
@@ -424,7 +425,7 @@ static inline void json_value_uint(struct json_state *js, unsigned long long val
 
 static inline void json_value_float(struct json_state *js, const char *fmt, double value)
 {
-	if (js->deferred) {
+	if (js->pool) {
 		char *p = json_token_reserve(js, 1 + sizeof(fmt) + sizeof(value));
 
 		*p++ = JSON_TOKEN_FLOAT;
@@ -437,7 +438,7 @@ static inline void json_value_float(struct json_state *js, const char *fmt, doub
 
 static inline void json_value_ts(struct json_state *js, u64 ns)
 {
-	if (js->deferred)
+	if (js->pool)
 		json_token_data(js, JSON_TOKEN_TS, &ns, sizeof(ns));
 	else
 		json_ts(&js->out, ns);
@@ -445,8 +446,8 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 
 static inline void json_init(struct json_state *js)
 {
-	js->deferred = true;
-	if (js->deferred) {
+	js->pool = wpool_new(4, json_work, json_done, js->out.f);
+	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
 	} else {
@@ -457,8 +458,9 @@ static inline void json_init(struct json_state *js)
 
 static inline void json_finish(struct json_state *js)
 {
-	if (js->deferred) {
+	if (js->pool) {
 		json_submit(js);
+		wpool_finish(js->pool);
 		free(js->batch);
 	} else {
 		json_flush(&js->out);
@@ -509,7 +511,7 @@ static inline void json_obj_end(struct json_state *js)
 
 static inline void json_key(struct json_state *js, const char *key)
 {
-	if (js->deferred)
+	if (js->pool)
 		json_token_string(js, js->cnt[js->lvl] ? JSON_TOKEN_KEY_COMMA : JSON_TOKEN_KEY, key);
 	else
 		json_putkey(&js->out, key, js->cnt[js->lvl]);
