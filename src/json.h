@@ -6,6 +6,8 @@
 
 #define JSON_FLUSH_SZ (1024 * 1024)
 
+#include "wrust.h"
+
 /*
  * LOW-LEVEL JSON BUILDER PRIMITIVES
  *
@@ -74,7 +76,8 @@ struct json_state {
 	size_t batch_capacity;
 	struct sbuf *task_cache;
 	size_t task_cache_cnt;
-	bool deferred;
+	struct wpool *pool;
+	bool no_parallel;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -102,6 +105,14 @@ struct json_job {
 	struct json_buf out;
 	struct json_options options;
 };
+
+static inline void json_float_stats_add(struct json_state *js, const struct json_buf *out)
+{
+	js->float_zero_count += out->float_zero_count;
+	js->float_integer_count += out->float_integer_count;
+	js->float_fractional_count += out->float_fractional_count;
+	js->float_fallback_count += out->float_fallback_count;
+}
 
 #define JSON_STATE_INIT(file) { .out = { .f = (file) }, .lvl = -1 }
 #define JSON_BUF_SZ (1024 * 1024)
@@ -352,6 +363,13 @@ static inline void json_ts(struct json_state *js, u64 ns)
 
 static inline void json_escape(struct json_state *js, unsigned char c)
 {
+	if (js->out.options.no_int_format) {
+		char text[7];
+		int n = snprintf(text, sizeof(text), "\\u%04x", c);
+
+		json_write(js, text, n);
+		return;
+	}
 	static const char hex[] = "0123456789abcdef";
 	char buf[] = { '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
 
@@ -773,8 +791,8 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 
 static inline void json_init(struct json_state *js)
 {
-	if (!js->out.options.no_batching)
-		js->pool = wpool_new(16, json_work, json_done, js);
+	if (!js->out.options.no_batching && !js->no_parallel)
+		js->pool = wpool_new(4, json_work, json_done, js);
 	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
@@ -881,7 +899,7 @@ static inline void json_obj_end(struct json_state *js)
 	js->lvl--;
 	if (js->lvl < 0) { /* outermost level, emit newline */
 		json_literal(js, "}\n", 2);
-		if (!js->pool && js->out.f && js->out.buffer.len >= JSON_FLUSH_SZ)
+		if (!js->pool && js->out.f && !js->out.options.no_batching && js->out.buffer.len >= JSON_BUF_SZ)
 			json_flush(js);
 	} else
 		json_char(js, '}');

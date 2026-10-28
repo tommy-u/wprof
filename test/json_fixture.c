@@ -10,7 +10,7 @@
 
 typedef uint64_t u64;
 #define __unused __attribute__((unused))
-#define BUG(...) do { fprintf(stderr, __VA_ARGS__); abort(); } while (0)
+#define BUG(...) abort()
 
 #ifdef JSON_REFERENCE
 #include "json_reference.h"
@@ -18,24 +18,71 @@ typedef uint64_t u64;
 #include "../src/json.h"
 #endif
 
+static bool float_timestamps;
+
+static void fixture_ts(struct json_state *js, const char *key, u64 ns)
+{
+	if (float_timestamps)
+		json_kv_float(js, key, "%.9lf", ns / 1e9);
+	else
+		json_kv_ts(js, key, ns);
+}
+
 int main(int argc, char **argv)
 {
-	bool empty = argc == 2 && strcmp(argv[1], "--empty") == 0;
-	bool large6 = argc == 2 && strcmp(argv[1], "--large-float6") == 0;
-	bool large9 = argc == 2 && strcmp(argv[1], "--large-float9") == 0;
+	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel" };
+	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel" };
+	const size_t debug_optimization[] = { 0, 1, 2, 3 };
+	bool disabled[4] = { false };
+	bool empty = false;
 
-	if (argc > 2 || (argc == 2 && !empty && !large6 && !large9))
-		return 2;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--empty") == 0) {
+			empty = true;
+		} else if (strcmp(argv[i], "--float-timestamps") == 0) {
+			float_timestamps = true;
+		} else if ((strcmp(argv[i], "--json-opt") == 0 || strcmp(argv[i], "--no-json-opt") == 0) && i + 1 < argc) {
+			bool disable = strcmp(argv[i], "--no-json-opt") == 0;
+			const char *name = argv[++i];
+			size_t optimization = 0;
+
+			if (strcmp(name, "all") == 0) {
+				for (size_t j = 0; j < 4; j++)
+					disabled[j] = disable;
+				continue;
+			}
+			while (optimization < 4 && strcmp(name, optimizations[optimization]) != 0)
+				optimization++;
+			if (optimization == 4)
+				return 2;
+			disabled[optimization] = disable;
+		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
+			const char *name = argv[++i];
+			size_t feature = 0;
+
+			while (feature < 4 && strcmp(name, features[feature]) != 0)
+				feature++;
+			if (feature == 4)
+				return 2;
+			disabled[debug_optimization[feature]] = true;
+		} else {
+			return 2;
+		}
+	}
 	struct json_state js = JSON_STATE_INIT(stdout);
 #ifndef JSON_REFERENCE
+	js.out.options = (struct json_options) {
+		.no_batching = disabled[0],
+		.no_int_format = disabled[1],
+		.no_int_ts = disabled[2],
+	};
+	js.no_parallel = disabled[3];
 	json_init(&js);
+#else
+	(void)disabled;
 #endif
 
-	if (large6 || large9) {
-		json_obj_start(&js);
-		json_kv_float(&js, "largest", large6 ? "%.6lf" : "%.9lf", DBL_MAX);
-		json_obj_end(&js);
-	} else if (!empty) {
+	if (!empty) {
 		char reused[32] = "original";
 		char reused_key[32] = "original-key";
 		char controls[32];
@@ -87,37 +134,34 @@ int main(int argc, char **argv)
 		}
 		json_arr_end(&js);
 		json_subobj_start(&js, "timestamps");
-		json_kv_ts(&js, "zero", 0);
-		json_kv_ts(&js, "one_ns", 1);
-		json_kv_ts(&js, "second_before", 999999999ULL);
-		json_kv_ts(&js, "second", 1000000000ULL);
-		json_kv_ts(&js, "second_after", 1000000001ULL);
-		json_kv_ts(&js, "guard_before", (1ULL << 22) * 1000000000ULL - 1);
-		json_kv_ts(&js, "guard", (1ULL << 22) * 1000000000ULL);
-		json_kv_ts(&js, "guard_after", (1ULL << 22) * 1000000000ULL + 1);
-		json_kv_ts(&js, "seconds_2p23_before", (1ULL << 23) * 1000000000ULL - 1);
-		json_kv_ts(&js, "seconds_2p23", (1ULL << 23) * 1000000000ULL);
-		json_kv_ts(&js, "seconds_2p23_after", (1ULL << 23) * 1000000000ULL + 1);
-		json_kv_ts(&js, "ns_2p53_before", (1ULL << 53) - 1);
-		json_kv_ts(&js, "ns_2p53", 1ULL << 53);
-		json_kv_ts(&js, "ns_2p53_after", (1ULL << 53) + 1);
-		json_kv_ts(&js, "maximum_before", UINT64_MAX - 1);
-		json_kv_ts(&js, "maximum", UINT64_MAX);
-		json_kv_ts(&js, "wrapped_minus_one", (u64)-1);
-		json_kv_ts(&js, "wrapped_before_second", (u64)-999999999LL);
-		json_kv_ts(&js, "wrapped_second", (u64)-1000000000LL);
-		json_kv_ts(&js, "wrapped_after_second", (u64)-1000000001LL);
-		json_kv_ts(&js, "wrapped_signed_min", (u64)INT64_MIN);
+		fixture_ts(&js, "zero", 0);
+		fixture_ts(&js, "one_ns", 1);
+		fixture_ts(&js, "second_before", 999999999ULL);
+		fixture_ts(&js, "second", 1000000000ULL);
+		fixture_ts(&js, "second_after", 1000000001ULL);
+		fixture_ts(&js, "guard_before", (1ULL << 22) * 1000000000ULL - 1);
+		fixture_ts(&js, "guard", (1ULL << 22) * 1000000000ULL);
+		fixture_ts(&js, "guard_after", (1ULL << 22) * 1000000000ULL + 1);
+		fixture_ts(&js, "seconds_2p23_before", (1ULL << 23) * 1000000000ULL - 1);
+		fixture_ts(&js, "seconds_2p23", (1ULL << 23) * 1000000000ULL);
+		fixture_ts(&js, "seconds_2p23_after", (1ULL << 23) * 1000000000ULL + 1);
+		fixture_ts(&js, "ns_2p53_before", (1ULL << 53) - 1);
+		fixture_ts(&js, "ns_2p53", 1ULL << 53);
+		fixture_ts(&js, "ns_2p53_after", (1ULL << 53) + 1);
+		fixture_ts(&js, "maximum_before", UINT64_MAX - 1);
+		fixture_ts(&js, "maximum", UINT64_MAX);
+		fixture_ts(&js, "wrapped_minus_one", (u64)-1);
+		fixture_ts(&js, "wrapped_before_second", (u64)-999999999LL);
+		fixture_ts(&js, "wrapped_second", (u64)-1000000000LL);
+		fixture_ts(&js, "wrapped_after_second", (u64)-1000000001LL);
+		fixture_ts(&js, "wrapped_signed_min", (u64)INT64_MIN);
 		json_obj_end(&js);
 		json_kv_float(&js, "zero6", "%.6lf", -0.0);
 		json_kv_float(&js, "zero9", "%.9lf", -0.0);
 		json_kv_float(&js, "positive_zero6", "%.6lf", 0.0);
 		json_kv_float(&js, "positive_zero9", "%.9lf", 0.0);
-#ifdef JSON_REFERENCE
-		/* Retain the frozen baseline payload; main checks oversized floats. */
 		json_kv_float(&js, "largest6", "%.6lf", DBL_MAX);
 		json_kv_float(&js, "largest9", "%.9lf", DBL_MAX);
-#endif
 		json_kv_float(&js, "smallest6", "%.6lf", DBL_MIN);
 		json_kv_float(&js, "smallest9", "%.9lf", DBL_MIN);
 		json_kv_float(&js, "rounding6", "%.6lf", 1.2345675);
@@ -158,7 +202,7 @@ int main(int argc, char **argv)
 		for (int i = 0; i < 12000; i++) {
 			json_obj_start(&js);
 			json_kv_int(&js, "id", i);
-			json_kv_ts(&js, "ts", 123456789ULL + i * 17ULL);
+			fixture_ts(&js, "ts", 123456789ULL + i * 17ULL);
 			json_subarr_start(&js, "values");
 			json_arr_int(&js, -i);
 			json_arr_float(&js, "%.6lf", i / 7.0);

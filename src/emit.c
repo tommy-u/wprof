@@ -6018,6 +6018,12 @@ int emit_trace(struct worker_state *w)
 		js.task_cache_cnt = w->dump_hdr->threads_sz / sizeof(struct wevent_task) + 1;
 		js.task_cache = calloc(js.task_cache_cnt, sizeof(*js.task_cache));
 		js.emit_ctx = w;
+		js.out.options = (struct json_options) {
+			.no_batching = env.json_no_batching,
+			.no_int_format = env.json_no_int_format,
+			.no_int_ts = env.json_no_int_ts,
+		};
+		js.no_parallel = env.json_no_parallel;
 		json_init(&js);
 		emit_header_json(w);
 		if (env.requested_stack_traces)

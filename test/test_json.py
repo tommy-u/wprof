@@ -5,8 +5,6 @@ from decimal import Decimal
 import hashlib
 import json
 import os
-import re
-import signal
 from pathlib import Path
 import shlex
 import shutil
@@ -21,33 +19,62 @@ WPROF = Path(os.environ.get("WPROF_BINARY", ROOT / "src/wprof"))
 REFERENCE_BYTES = 7219740
 REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
-
-
 EXACT_TIMESTAMPS = {
-    "zero": "0.000000000",
-    "one_ns": "0.000000001",
-    "second_before": "0.999999999",
-    "second": "1.000000000",
-    "second_after": "1.000000001",
-    "guard_before": "4194303.999999999",
-    "guard": "4194304.000000000",
-    "guard_after": "4194304.000000001",
-    "seconds_2p23_before": "8388607.999999999",
-    "seconds_2p23": "8388608.000000000",
+    "zero": "0.000000000", "one_ns": "0.000000001",
+    "second_before": "0.999999999", "second": "1.000000000", "second_after": "1.000000001",
+    "guard_before": "4194303.999999999", "guard": "4194304.000000000", "guard_after": "4194304.000000001",
+    "seconds_2p23_before": "8388607.999999999", "seconds_2p23": "8388608.000000000",
     "seconds_2p23_after": "8388608.000000001",
-    "ns_2p53_before": "9007199.254740991",
-    "ns_2p53": "9007199.254740992",
-    "ns_2p53_after": "9007199.254740993",
-    "maximum_before": "18446744073.709551614",
-    "maximum": "18446744073.709551615",
-    "wrapped_minus_one": "18446744073.709551615",
-    "wrapped_before_second": "18446744072.709551617",
-    "wrapped_second": "18446744072.709551616",
-    "wrapped_after_second": "18446744072.709551615",
+    "ns_2p53_before": "9007199.254740991", "ns_2p53": "9007199.254740992", "ns_2p53_after": "9007199.254740993",
+    "maximum_before": "18446744073.709551614", "maximum": "18446744073.709551615",
+    "wrapped_minus_one": "18446744073.709551615", "wrapped_before_second": "18446744072.709551617",
+    "wrapped_second": "18446744072.709551616", "wrapped_after_second": "18446744072.709551615",
     "wrapped_signed_min": "9223372036.854775808",
 }
 
+
+JSON_OPTIMIZATIONS = (
+    'buffering', 'integers', 'timestamps', 'parallel',
+)
+
+
+JSON_DEBUG_FEATURES = (
+    'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel',
+)
+
+
 class JsonOptionsTest(unittest.TestCase):
+    def test_json_debug_features_are_accepted(self):
+        for feature in JSON_DEBUG_FEATURES:
+            with self.subTest(feature=feature):
+                result = subprocess.run(
+                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--debug", feature],
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b"Unrecognized debug feature", result.stderr)
+                self.assertIn(b"/missing-json-test.data", result.stderr)
+
+    def test_unknown_json_optimization_is_rejected(self):
+        for flag in ("--json-opt", "--no-json-opt"):
+            with self.subTest(flag=flag):
+                result = subprocess.run([str(WPROF), flag, "unknown"], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Unknown JSON optimization 'unknown'", result.stderr)
+                self.assertIn(flag.encode(), result.stderr)
+
+    def test_json_optimization_controls_are_accepted(self):
+        for flag in ("--json-opt", "--no-json-opt"):
+            for name in (*JSON_OPTIMIZATIONS, "all"):
+                with self.subTest(flag=flag, name=name):
+                    result = subprocess.run(
+                        [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", flag, name],
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(b"Unknown JSON optimization", result.stderr)
+                    self.assertIn(b"/missing-json-test.data", result.stderr)
+
     def test_removed_mode_and_tuning_flags_are_rejected(self):
         for flags in (("--fast-json",), ("--json-workers", "4"), ("--json-batch-size", "1mb")):
             with self.subTest(flags=flags):
@@ -66,6 +93,58 @@ class JsonOptionsTest(unittest.TestCase):
 
 
 class JsonWriterTest(unittest.TestCase):
+    @staticmethod
+    def reference_for_options(reference, flags):
+        legacy_timestamps = False
+        for option, value in zip(flags, flags[1:]):
+            if option == "--debug" and value == "json-no-int-ts":
+                legacy_timestamps = True
+            elif option in ("--json-opt", "--no-json-opt") and value in ("timestamps", "all"):
+                legacy_timestamps = option == "--no-json-opt"
+        if legacy_timestamps:
+            return reference
+        legacy = json.loads(reference.splitlines()[0], parse_float=Decimal)["timestamps"]
+        expected = reference
+        for key, value in EXACT_TIMESTAMPS.items():
+            old = f'"{key}":{legacy[key]:.9f}'.encode()
+            new = f'"{key}":{value}'.encode()
+            expected = expected.replace(old, new, 1)
+        return expected
+
+    def test_debug_combinations_match_reference_bytes(self):
+        checked = 0
+        for mask in range(1 << len(JSON_DEBUG_FEATURES)):
+            features = [feature for bit, feature in enumerate(JSON_DEBUG_FEATURES) if mask & (1 << bit)]
+            if "json-no-parallel" in JSON_DEBUG_FEATURES and "json-no-batching" in features and "json-no-parallel" not in features:
+                continue
+            flags = [arg for feature in features for arg in ("--debug", feature)]
+            with self.subTest(features=features):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags])
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags])
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, self.reference_for_options(reference, flags))
+                self.assertEqual(hashlib.sha256(reference).hexdigest(), REFERENCE_SHA256)
+                checked += 1
+        self.assertGreater(checked, 0)
+        print(f"Verified {checked} debug combinations, SHA-256 {REFERENCE_SHA256}")
+
+    def test_named_optimization_controls_match_reference_bytes(self):
+        settings = [["--no-json-opt", name] for name in JSON_OPTIMIZATIONS]
+        settings.extend((
+            ["--no-json-opt", "all"],
+            ["--no-json-opt", "all", "--json-opt", "all"],
+            ["--json-opt", "all", "--no-json-opt", "all"],
+            ["--debug", "json-no-parallel", "--json-opt", "parallel"],
+            ["--json-opt", "parallel", "--debug", "json-no-parallel"],
+        ))
+        for flags in settings:
+            with self.subTest(flags=flags):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, self.reference_for_options(reference, flags))
+                self.assertEqual(hashlib.sha256(reference).hexdigest(), REFERENCE_SHA256)
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="wprof-json-reference-test-")
@@ -95,27 +174,31 @@ class JsonWriterTest(unittest.TestCase):
 
         cls.reference = subprocess.check_output([str(cls.fixtures["reference"])])
         cls.output = subprocess.check_output([str(cls.fixtures["default"])])
+        cls.float_output = subprocess.check_output([str(cls.fixtures["default"]), "--float-timestamps"], timeout=30)
+        cls.float_records = [json.loads(line, parse_float=Decimal) for line in cls.float_output.splitlines()]
         cls.lines = cls.output.splitlines()
         cls.records = [json.loads(line, parse_float=Decimal) for line in cls.lines]
 
-    def test_default_preserves_reference_except_documented_main_changes(self):
+    def test_float_timestamps_match_frozen_reference_bytes(self):
         digest = hashlib.sha256(self.reference).hexdigest()
         self.assertEqual(len(self.reference), REFERENCE_BYTES)
         self.assertEqual(len(self.reference.splitlines()), REFERENCE_RECORDS)
         self.assertEqual(digest, REFERENCE_SHA256)
-        # The baseline remains pinned. Main preserves exact large timestamps
-        # and rejects floats that exceed its checked formatting buffer.
-        expected_lines = self.reference.splitlines(keepends=True)
-        first, count = re.subn(rb'"largest(?:6|9)":[-0-9.]+,', b"", expected_lines[0])
-        self.assertEqual(count, 2)
+        self.assertEqual(len(self.float_output), len(self.reference))
+        self.assertEqual(hashlib.sha256(self.float_output).hexdigest(), digest)
+        self.assertEqual(self.float_output, self.reference)
+        print(f"Verified {len(self.reference)} bytes, {len(self.lines)} records, SHA-256 {digest}")
+
+    def test_default_preserves_bytes_with_exact_timestamps(self):
+        legacy = json.loads(self.reference.splitlines()[0], parse_float=Decimal)["timestamps"]
+        expected = self.reference
         for key, value in EXACT_TIMESTAMPS.items():
-            pattern = b'"' + key.encode() + rb'":[-0-9.]+'
-            first, count = re.subn(pattern, b'"' + key.encode() + b'":' + value.encode(), first)
-            self.assertEqual(count, 1, key)
-        expected_lines[0] = first
-        expected = b"".join(expected_lines)
+            old = f'"{key}":{legacy[key]:.9f}'.encode()
+            new = f'"{key}":{value}'.encode()
+            self.assertEqual(expected.count(old), 1)
+            expected = expected.replace(old, new, 1)
         self.assertEqual(self.output, expected)
-        print(f"Verified {len(self.output)} bytes, {len(self.lines)} records, SHA-256 {hashlib.sha256(self.output).hexdigest()}")
+        self.assertEqual(self.records[0]["timestamps"], {key: Decimal(value) for key, value in EXACT_TIMESTAMPS.items()})
 
     def test_control_bytes_utf8_and_owned_strings(self):
         first = self.records[0]
@@ -166,19 +249,8 @@ class JsonWriterTest(unittest.TestCase):
         for key, places in (("largest6", 6), ("largest9", 9)):
             with self.subTest(key=key):
                 value = largest + "." + "0" * places
-                self.assertIn(f'"{key}":{value},'.encode(), self.reference.splitlines()[0])
-                reference = json.loads(self.reference.splitlines()[0], parse_float=Decimal)
-                self.assertEqual(reference[key], Decimal(value))
-
-    def test_oversized_float_reports_the_main_buffer_limit(self):
-        for places in (6, 9):
-            with self.subTest(places=places):
-                flag = f"--large-float{places}"
-                reference = subprocess.check_output([str(self.fixtures["reference"]), flag])
-                self.assertIn(b'"largest":179769313486231570', reference)
-                result = subprocess.run([str(self.fixtures["default"]), flag], capture_output=True)
-                self.assertEqual(result.returncode, -signal.SIGABRT)
-                self.assertIn(b"JSON float buffer too small", result.stderr)
+                self.assertIn(f'"{key}":{value},'.encode(), self.lines[0])
+                self.assertEqual(first[key], Decimal(value))
 
     def test_integer_decimal_boundaries_in_objects_and_arrays(self):
         values = [
@@ -205,12 +277,34 @@ class JsonWriterTest(unittest.TestCase):
                     expected.update(positive=value, negative=-value, signed_array=[value, -value])
                 self.assertEqual(row, expected)
 
-    def test_timestamps_preserve_exact_nanoseconds_at_large_boundaries(self):
-        expected = EXACT_TIMESTAMPS
-        self.assertEqual(self.records[0]["timestamps"], {key: Decimal(value) for key, value in expected.items()})
+    def test_timestamp_rollover_and_float_fallback_boundaries(self):
+        expected = {
+            "zero": "0.000000000",
+            "one_ns": "0.000000001",
+            "second_before": "0.999999999",
+            "second": "1.000000000",
+            "second_after": "1.000000001",
+            "guard_before": "4194303.999999999",
+            "guard": "4194304.000000000",
+            "guard_after": "4194304.000000001",
+            "seconds_2p23_before": "8388607.999999999",
+            "seconds_2p23": "8388608.000000000",
+            "seconds_2p23_after": "8388608.000000002",
+            "ns_2p53_before": "9007199.254740991",
+            "ns_2p53": "9007199.254740993",
+            "ns_2p53_after": "9007199.254740993",
+            "maximum_before": "18446744073.709552765",
+            "maximum": "18446744073.709552765",
+            "wrapped_minus_one": "18446744073.709552765",
+            "wrapped_before_second": "18446744072.709552765",
+            "wrapped_second": "18446744072.709552765",
+            "wrapped_after_second": "18446744072.709552765",
+            "wrapped_signed_min": "9223372036.854776382",
+        }
+        self.assertEqual(self.float_records[0]["timestamps"], {key: Decimal(value) for key, value in expected.items()})
         for key, value in expected.items():
             with self.subTest(key=key):
-                self.assertIn(f'"{key}":{value}'.encode(), self.lines[0])
+                self.assertIn(f'"{key}":{value}'.encode(), self.float_output.splitlines()[0])
 
     def test_nested_arrays_null_and_booleans(self):
         first = self.records[0]
