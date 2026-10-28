@@ -5,5 +5,6 @@
 //! entry points (collected into `libwrust_c.a`). Add new modules here as the
 //! need for more Rust-backed interfaces comes up.
 
+mod pool;
 mod pq;
 mod sort;
