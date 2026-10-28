@@ -22,12 +22,12 @@ REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d
 
 
 JSON_OPTIMIZATIONS = (
-    'buffering',
+    'buffering', 'integers',
 )
 
 
 JSON_DEBUG_FEATURES = (
-    'json-no-batching',
+    'json-no-batching', 'json-no-int-format',
 )
 
 

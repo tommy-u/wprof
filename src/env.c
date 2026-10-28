@@ -153,6 +153,7 @@ static const struct {
 	bool enabled_value;
 } json_optimizations[] = {
 	{ "buffering", &env.json_no_batching, false },
+	{ "integers", &env.json_no_int_format, false },
 };
 
 static int set_json_optimization(const char *name, bool enabled)
@@ -173,7 +174,7 @@ static const struct argp_option opts[] = {
 	{ "verbose", 'v', NULL, 0, "Verbose output" },
 	{ "stats", OPT_STATS, NULL, 0, "Print various wprof stats (BPF, resource usage, etc.)" },
 	{ "debug", OPT_DEBUG, "FEAT", 0,
-	  "Debug features (pb-debug-interns, pb-disable-interns, json-no-batching, "
+	  "Debug features (pb-debug-interns, pb-disable-interns, json-no-batching, json-no-int-format, "
 	  "keep-workdir, raw-stacks, no-tsidx, no-task-storage, fr-chunk-size=SIZE)" },
 	{ "log", OPT_LOG, "LOG", 0, "Debug logging subset selector (libbpf, usdt, topology, inject, tracee, discovery)"},
 	{ "dur", 'd', "DURATION", 0, "Limit running duration; accepts time units s/ms/us/ns/m/h, bare number is ms (default: 1000ms)" },
@@ -191,7 +192,7 @@ static const struct argp_option opts[] = {
 	{ "trace", 'T', "FILE", 0, "Emit Perfetto trace to specified file (use '-' for stdout)" },
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
-	  "Enable JSON optimization: buffering, all (last setting wins)" },
+	  "Enable JSON optimization: buffering, integers, all (last setting wins)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 
@@ -322,6 +323,8 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			env.pb_disable_interns = true;
 		} else if (strcasecmp(arg, "json-no-batching") == 0) {
 			env.json_no_batching = true;
+		} else if (strcasecmp(arg, "json-no-int-format") == 0) {
+			env.json_no_int_format = true;
 		} else if (strcasecmp(arg, "keep-workdir") == 0) {
 			env.keep_workdir = true;
 		} else if (strcasecmp(arg, "raw-stacks") == 0) {
