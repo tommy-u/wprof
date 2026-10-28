@@ -1636,7 +1636,7 @@ static void json_task(struct json_state *j, const char *key, const struct wprof_
 		struct json_state fragment = { .lvl = 0 };
 
 		json_task_object(&fragment, t);
-		*cached = fragment.out;
+		*cached = fragment.out.buffer;
 	}
 	json_fragment(j, cached->buf, cached->len);
 }
