@@ -10,6 +10,7 @@
 
 typedef uint64_t u64;
 #define __unused __attribute__((unused))
+#define BUG(...) abort()
 
 #ifdef JSON_REFERENCE
 #include "json_reference.h"
@@ -24,6 +25,9 @@ int main(int argc, char **argv)
 	if (argc > 2 || (argc == 2 && !empty))
 		return 2;
 	struct json_state js = JSON_STATE_INIT(stdout);
+#ifndef JSON_REFERENCE
+	json_init(&js);
+#endif
 
 	if (!empty) {
 		char reused[32] = "original";
@@ -180,5 +184,8 @@ int main(int argc, char **argv)
 		json_obj_end(&js);
 	}
 
+#ifndef JSON_REFERENCE
+	json_finish(&js);
+#endif
 	return fflush(stdout) || ferror(stdout) ? 1 : 0;
 }

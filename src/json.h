@@ -26,7 +26,9 @@ struct json_state {
 
 #define JSON_STATE_INIT(file) { .out = { .f = (file) }, .lvl = -1 }
 
+#ifndef JSON_BUF_SZ
 #define JSON_BUF_SZ (1024 * 1024)
+#endif
 
 static inline void json_init(struct json_state *js)
 {
@@ -169,7 +171,7 @@ static inline int json_utf8_seq_len(const unsigned char *p)
  * arbitrary byte content (e.g. utrace buffers or metadata with quotes or
  * newlines) can never produce undecodable output.
  */
-static inline void json_puts(struct json_buf *b, const char *s)
+static inline const char *json_puts(struct json_buf *b, const char *s)
 {
 	const unsigned char *p = (const unsigned char *)s;
 
@@ -183,7 +185,7 @@ static inline void json_puts(struct json_buf *b, const char *s)
 
 		unsigned char c = *p;
 		switch (c) {
-		case 0: return;
+		case 0: return (const char *)p;
 		case '"':  json_write(b, "\\\"", 2); p++; break;
 		case '\\': json_write(b, "\\\\", 2); p++; break;
 		case '\n': json_write(b, "\\n", 2); p++; break;
@@ -208,6 +210,7 @@ static inline void json_puts(struct json_buf *b, const char *s)
 			}
 		}
 	}
+	return (const char *)p;
 }
 
 static inline void json_vprintf(struct json_state *js, const char *fmt, va_list ap)
