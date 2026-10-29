@@ -31,30 +31,17 @@ EXACT_TIMESTAMPS = {
     "wrapped_second": "18446744072.709551616", "wrapped_after_second": "18446744072.709551615",
     "wrapped_signed_min": "9223372036.854775808",
 }
-
-
-JSON_OPTIMIZATIONS = (
-    'buffering', 'integers', 'timestamps', 'parallel',
-)
-
-
 JSON_DEBUG_FEATURES = (
     'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel',
 )
 
 
-class JsonOptionsTest(unittest.TestCase):
-    def test_json_debug_features_are_accepted(self):
-        for feature in JSON_DEBUG_FEATURES:
-            with self.subTest(feature=feature):
-                result = subprocess.run(
-                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--debug", feature],
-                    capture_output=True,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn(b"Unrecognized debug feature", result.stderr)
-                self.assertIn(b"/missing-json-test.data", result.stderr)
+JSON_OPTIMIZATIONS = (
+    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens',
+)
 
+
+class JsonOptionsTest(unittest.TestCase):
     def test_unknown_json_optimization_is_rejected(self):
         for flag in ("--json-opt", "--no-json-opt"):
             with self.subTest(flag=flag):
@@ -91,6 +78,17 @@ class JsonOptionsTest(unittest.TestCase):
         for flag in (b"--fast-json", b"--json-workers", b"--json-batch-size"):
             self.assertNotIn(flag, result.stdout)
 
+    def test_json_debug_features_are_accepted(self):
+        for feature in JSON_DEBUG_FEATURES:
+            with self.subTest(feature=feature):
+                result = subprocess.run(
+                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--debug", feature],
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b"Unrecognized debug feature", result.stderr)
+                self.assertIn(b"/missing-json-test.data", result.stderr)
+
 
 class JsonWriterTest(unittest.TestCase):
     @staticmethod
@@ -110,23 +108,6 @@ class JsonWriterTest(unittest.TestCase):
             new = f'"{key}":{value}'.encode()
             expected = expected.replace(old, new, 1)
         return expected
-
-    def test_debug_combinations_match_reference_bytes(self):
-        checked = 0
-        for mask in range(1 << len(JSON_DEBUG_FEATURES)):
-            features = [feature for bit, feature in enumerate(JSON_DEBUG_FEATURES) if mask & (1 << bit)]
-            if "json-no-parallel" in JSON_DEBUG_FEATURES and "json-no-batching" in features and "json-no-parallel" not in features:
-                continue
-            flags = [arg for feature in features for arg in ("--debug", feature)]
-            with self.subTest(features=features):
-                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags])
-                output = subprocess.check_output([str(self.fixtures["default"]), *flags])
-                self.assertEqual(reference, self.reference)
-                self.assertEqual(output, self.reference_for_options(reference, flags))
-                self.assertEqual(hashlib.sha256(reference).hexdigest(), REFERENCE_SHA256)
-                checked += 1
-        self.assertGreater(checked, 0)
-        print(f"Verified {checked} debug combinations, SHA-256 {REFERENCE_SHA256}")
 
     def test_named_optimization_controls_match_reference_bytes(self):
         settings = [["--no-json-opt", name] for name in JSON_OPTIMIZATIONS]
@@ -199,6 +180,23 @@ class JsonWriterTest(unittest.TestCase):
             expected = expected.replace(old, new, 1)
         self.assertEqual(self.output, expected)
         self.assertEqual(self.records[0]["timestamps"], {key: Decimal(value) for key, value in EXACT_TIMESTAMPS.items()})
+
+    def test_debug_combinations_match_reference_bytes(self):
+        checked = 0
+        for mask in range(1 << len(JSON_DEBUG_FEATURES)):
+            features = [feature for bit, feature in enumerate(JSON_DEBUG_FEATURES) if mask & (1 << bit)]
+            if "json-no-parallel" in JSON_DEBUG_FEATURES and "json-no-batching" in features and "json-no-parallel" not in features:
+                continue
+            flags = [arg for feature in features for arg in ("--debug", feature)]
+            with self.subTest(features=features):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags])
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags])
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, self.reference_for_options(reference, flags))
+                self.assertEqual(hashlib.sha256(reference).hexdigest(), REFERENCE_SHA256)
+                checked += 1
+        self.assertGreater(checked, 0)
+        print(f"Verified {checked} debug combinations, SHA-256 {REFERENCE_SHA256}")
 
     def test_control_bytes_utf8_and_owned_strings(self):
         first = self.records[0]
