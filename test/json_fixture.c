@@ -21,9 +21,9 @@ typedef uint64_t u64;
 int main(int argc, char **argv)
 {
 	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel" };
-	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens" };
+	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths" };
 	const size_t debug_optimization[] = { 0, 1, 2, 3 };
-	bool disabled[5] = { false };
+	bool disabled[6] = { false };
 	bool empty = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -35,13 +35,13 @@ int main(int argc, char **argv)
 			size_t optimization = 0;
 
 			if (strcmp(name, "all") == 0) {
-				for (size_t j = 0; j < 5; j++)
+				for (size_t j = 0; j < 6; j++)
 					disabled[j] = disable;
 				continue;
 			}
-			while (optimization < 5 && strcmp(name, optimizations[optimization]) != 0)
+			while (optimization < 6 && strcmp(name, optimizations[optimization]) != 0)
 				optimization++;
-			if (optimization == 5)
+			if (optimization == 6)
 				return 2;
 			disabled[optimization] = disable;
 		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
@@ -64,6 +64,7 @@ int main(int argc, char **argv)
 		.no_int_format = disabled[1],
 		.no_int_ts = disabled[2],
 		.no_key_tokens = disabled[4],
+		.no_literal_lengths = disabled[5],
 	};
 	js.no_parallel = disabled[3];
 	json_init(&js);

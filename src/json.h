@@ -148,6 +148,7 @@ struct json_options {
 	bool no_int_format;
 	bool no_int_ts;
 	bool no_key_tokens;
+	bool no_literal_lengths;
 };
 
 struct json_buf {
@@ -906,6 +907,23 @@ static inline void json_kv_str_id(struct json_state *js, enum json_key_id id, co
 		json_field_string(js, id, value);
 	else
 		json_kv_str(js, json_known_keys[id].key, value);
+}
+
+/* value_len excludes the NUL terminator. */
+static inline void json_kv_str_id_n(struct json_state *js, enum json_key_id id, const char *value, size_t value_len)
+{
+	if (js->out.options.no_literal_lengths) {
+		json_kv_str_id(js, id, value);
+	} else if (js->pool) {
+		if (js->out.options.no_key_tokens) {
+			json_key(js, json_known_keys[id].key);
+			json_token_data(js, JSON_TOKEN_QUOTED, value, value_len + 1);
+		} else {
+			json_field_data(js, id, JSON_TOKEN_QUOTED, value, value_len + 1);
+		}
+	} else {
+		json_kv_str(js, json_known_keys[id].key, value);
+	}
 }
 
 __attribute__((format(printf, 3, 4)))
