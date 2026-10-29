@@ -13,9 +13,118 @@ enum json_scope {
 	JSON_ARR,
 };
 
+#define JSON_SCHEMA_KEYS(X) \
+	X(ACTION, "action") \
+	X(ANNS, "anns") \
+	X(ARGS, "args") \
+	X(BLOCK, "block") \
+	X(BYTE_CNT, "byte_cnt") \
+	X(CHILD, "child") \
+	X(COMM, "comm") \
+	X(COMPOUND_CHAIN_LEN, "compound_chain_len") \
+	X(COMPOUND_DELAY, "compound_delay") \
+	X(CONTEXT_ID, "context_id") \
+	X(CORR_ID, "corr_id") \
+	X(CPU, "cpu") \
+	X(DESC, "desc") \
+	X(DEVICE_ID, "device_id") \
+	X(DSQ_ID, "dsq_id") \
+	X(DST_DEVICE_ID, "dst_device_id") \
+	X(DST_KIND, "dst_kind") \
+	X(DUR, "dur") \
+	X(EVENT, "event") \
+	X(EXTRAS, "extras") \
+	X(FILE, "file") \
+	X(FILENAME, "filename") \
+	X(FLOW_ID, "flow_id") \
+	X(FRAMES, "frames") \
+	X(GRID, "grid") \
+	X(ID, "id") \
+	X(INSERT_TYPE, "insert_type") \
+	X(IPI_DELAY, "ipi_delay") \
+	X(IRQ, "irq") \
+	X(IRQ_CTX, "irq_ctx") \
+	X(KIND, "kind") \
+	X(LATENCY, "latency") \
+	X(LAYER_ID, "layer_id") \
+	X(LINENO, "lineno") \
+	X(METADATA, "metadata") \
+	X(METHOD, "method") \
+	X(NAME, "name") \
+	X(NEXT, "next") \
+	X(NEXT_PRIO, "next_prio") \
+	X(NEXT_STATE, "next_state") \
+	X(NUMA, "numa") \
+	X(OFFCPU_DUR, "offcpu_dur") \
+	X(OFFCPU_STACK_ID, "offcpu_stack_id") \
+	X(OLD_COMM, "old_comm") \
+	X(OLD_TID, "old_tid") \
+	X(PCOMM, "pcomm") \
+	X(PID, "pid") \
+	X(PMU, "pmu") \
+	X(PMUS, "pmus") \
+	X(PREV, "prev") \
+	X(PREV_PRIO, "prev_prio") \
+	X(PREV_STATE, "prev_state") \
+	X(REQ_ID, "req_id") \
+	X(REQ_NAME, "req_name") \
+	X(REQ_TASK_ID, "req_task_id") \
+	X(RPC_ID, "rpc_id") \
+	X(SAMPLE_PERIOD, "sample_period") \
+	X(SENDER_CPU, "sender_cpu") \
+	X(SERVICE, "service") \
+	X(SRC_DEVICE_ID, "src_device_id") \
+	X(SRC_KIND, "src_kind") \
+	X(SRCS, "srcs") \
+	X(STACK_CNT, "stack_cnt") \
+	X(STACK_ID, "stack_id") \
+	X(STACKS, "stacks") \
+	X(START_TS, "start_ts") \
+	X(STREAM_ID, "stream_id") \
+	X(SUCCESS, "success") \
+	X(T, "t") \
+	X(TARGET_CPU, "target_cpu") \
+	X(TASK, "task") \
+	X(TID, "tid") \
+	X(TIMER_FREQ_HZ, "timer_freq_hz") \
+	X(TIMESTAMP, "timestamp") \
+	X(TS, "ts") \
+	X(UTRACE_ID, "utrace_id") \
+	X(VERSION, "version") \
+	X(WAIT_TIME, "wait_time") \
+	X(WAKEE, "wakee") \
+	X(WAKER, "waker") \
+	X(WAKER_STACK_ID, "waker_stack_id") \
+	X(WAKING_CPU, "waking_cpu") \
+	X(WAKING_REASON, "waking_reason") \
+	X(WAKING_TS, "waking_ts")
+
+#define JSON_KEY_ENUM(id, text) JSON_KEY_##id,
+enum json_key_id {
+	JSON_SCHEMA_KEYS(JSON_KEY_ENUM)
+	JSON_KEY_COUNT,
+};
+#undef JSON_KEY_ENUM
+
+_Static_assert(JSON_KEY_COUNT <= 256, "key IDs must fit in a byte");
+
+struct json_known_key {
+	const char *key;
+	const char *prefix;
+	size_t prefix_len;
+};
+
+#define JSON_KEY_ENTRY(id, text) [JSON_KEY_##id] = { text, "\"" text "\":", sizeof(text) + 2 },
+static const struct json_known_key json_known_keys[] = {
+	JSON_SCHEMA_KEYS(JSON_KEY_ENTRY)
+};
+#undef JSON_KEY_ENTRY
+#undef JSON_SCHEMA_KEYS
+
 /* Batches contain ASCII syntax and complete typed tokens with native-endian
  * payloads. Strings are copied immediately, including their NUL terminator;
- * float format pointers refer to static literals.
+ * float format pointers refer to static literals. Combined fields contain a
+ * key ID, a value kind, and its payload; FIELD_COMMA includes the leading comma.
  */
 enum json_token {
 	JSON_TOKEN_INT = 0x80,
@@ -26,12 +135,19 @@ enum json_token {
 	JSON_TOKEN_KEY = 0x85,
 	JSON_TOKEN_KEY_COMMA = 0x86,
 	JSON_TOKEN_QUOTED = 0x87,
+	JSON_TOKEN_FIELD = 0x88,
+	JSON_TOKEN_FIELD_COMMA = 0x89,
+	JSON_TOKEN_NULL = 0x8a,
+	JSON_TOKEN_TRUE = 0x8b,
+	JSON_TOKEN_FALSE = 0x8c,
+	JSON_TOKEN_KEY_ONLY = 0x8d,
 };
 
 struct json_options {
 	bool no_batching;
 	bool no_int_format;
 	bool no_int_ts;
+	bool no_key_tokens;
 };
 
 struct json_buf {
@@ -326,6 +442,14 @@ static inline void json_render(const char *data, size_t len, struct json_options
 	while (p < end) {
 		unsigned char token = *p++;
 
+		if (token == JSON_TOKEN_FIELD || token == JSON_TOKEN_FIELD_COMMA) {
+			unsigned char id = *p++;
+
+			if (token == JSON_TOKEN_FIELD_COMMA)
+				json_putc(out, ',');
+			json_write(out, json_known_keys[id].prefix, json_known_keys[id].prefix_len);
+			token = *p++;
+		}
 		switch (token) {
 		case JSON_TOKEN_INT: {
 			long long value;
@@ -371,6 +495,17 @@ static inline void json_render(const char *data, size_t len, struct json_options
 			break;
 		case JSON_TOKEN_QUOTED:
 			p = (const unsigned char *)json_putquoted(out, (const char *)p) + 1;
+			break;
+		case JSON_TOKEN_NULL:
+			json_write(out, "null", 4);
+			break;
+		case JSON_TOKEN_TRUE:
+			json_write(out, "true", 4);
+			break;
+		case JSON_TOKEN_FALSE:
+			json_write(out, "false", 5);
+			break;
+		case JSON_TOKEN_KEY_ONLY:
 			break;
 		default:
 			json_putc(out, token);
@@ -437,6 +572,28 @@ static inline void json_token_data(struct json_state *js, enum json_token token,
 static inline void json_token_string(struct json_state *js, enum json_token token, const char *s)
 {
 	json_token_data(js, token, s, strlen(s) + 1);
+}
+
+static inline char *json_field_reserve(struct json_state *js, enum json_key_id id, enum json_token kind, size_t n)
+{
+	char *p = json_token_reserve(js, 3 + n);
+
+	*p++ = js->cnt[js->lvl] ? JSON_TOKEN_FIELD_COMMA : JSON_TOKEN_FIELD;
+	*p++ = id;
+	*p++ = kind;
+	js->cnt[js->lvl]++;
+	return p;
+}
+
+static inline void json_field_data(struct json_state *js, enum json_key_id id, enum json_token kind,
+				   const void *data, size_t n)
+{
+	memcpy(json_field_reserve(js, id, kind, n), data, n);
+}
+
+static inline void json_field_string(struct json_state *js, enum json_key_id id, const char *s)
+{
+	json_field_data(js, id, JSON_TOKEN_QUOTED, s, strlen(s) + 1);
 }
 
 static inline void json_literal(struct json_state *js, const char *s, size_t n)
@@ -527,27 +684,35 @@ static inline void json_finish(struct json_state *js)
 	}
 }
 
-static inline void json_vprintf(struct json_state *js, const char *fmt, va_list ap)
+static inline void json_vprintf_id(struct json_state *js, enum json_key_id id, const char *fmt, va_list ap)
 {
-	char buf[256];
+	char buf[256], *value = buf;
 	va_list ap2;
 
 	va_copy(ap2, ap);
 	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
 	if (n < 0) {
+		if (id != JSON_KEY_COUNT)
+			json_field_string(js, id, "");
 		va_end(ap2);
 		return;
 	}
-	if ((size_t)n < sizeof(buf)) {
-		json_string(js, buf, false);
-	} else {
-		char *heap = malloc(n + 1);
-
-		vsnprintf(heap, n + 1, fmt, ap2);
-		json_string(js, heap, false);
-		free(heap);
+	if ((size_t)n >= sizeof(buf)) {
+		value = malloc(n + 1);
+		vsnprintf(value, n + 1, fmt, ap2);
 	}
+	if (id == JSON_KEY_COUNT)
+		json_string(js, value, false);
+	else
+		json_field_string(js, id, value);
+	if (value != buf)
+		free(value);
 	va_end(ap2);
+}
+
+static inline void json_vprintf(struct json_state *js, const char *fmt, va_list ap)
+{
+	json_vprintf_id(js, JSON_KEY_COUNT, fmt, ap);
 }
 
 static inline void json_obj_start(struct json_state *js)
@@ -705,4 +870,108 @@ static inline void json_arr_null(struct json_state *js)
 {
 	json_arr_elem(js);
 	json_literal(js, "null", 4);
+}
+
+static inline void json_key_id(struct json_state *js, enum json_key_id id)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_reserve(js, id, JSON_TOKEN_KEY_ONLY, 0);
+	else
+		json_key(js, json_known_keys[id].key);
+}
+
+static inline void json_subobj_start_id(struct json_state *js, enum json_key_id id)
+{
+	if (js->pool && !js->out.options.no_key_tokens) {
+		json_key_id(js, id);
+		json_obj_start(js);
+	} else {
+		json_subobj_start(js, json_known_keys[id].key);
+	}
+}
+
+static inline void json_subarr_start_id(struct json_state *js, enum json_key_id id)
+{
+	if (js->pool && !js->out.options.no_key_tokens) {
+		json_key_id(js, id);
+		json_arr_start(js);
+	} else {
+		json_subarr_start(js, json_known_keys[id].key);
+	}
+}
+
+static inline void json_kv_str_id(struct json_state *js, enum json_key_id id, const char *value)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_string(js, id, value);
+	else
+		json_kv_str(js, json_known_keys[id].key, value);
+}
+
+__attribute__((format(printf, 3, 4)))
+static inline void json_kv_fmt_id(struct json_state *js, enum json_key_id id, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	if (js->pool && !js->out.options.no_key_tokens) {
+		json_vprintf_id(js, id, fmt, ap);
+	} else {
+		json_key(js, json_known_keys[id].key);
+		json_char(js, '"');
+		json_vprintf(js, fmt, ap);
+		json_char(js, '"');
+	}
+	va_end(ap);
+}
+
+static inline void json_kv_int_id(struct json_state *js, enum json_key_id id, long long value)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_data(js, id, JSON_TOKEN_INT, &value, sizeof(value));
+	else
+		json_kv_int(js, json_known_keys[id].key, value);
+}
+
+static inline void json_kv_uint_id(struct json_state *js, enum json_key_id id, unsigned long long value)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_data(js, id, JSON_TOKEN_UINT, &value, sizeof(value));
+	else
+		json_kv_uint(js, json_known_keys[id].key, value);
+}
+
+static inline void json_kv_null_id(struct json_state *js, enum json_key_id id)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_reserve(js, id, JSON_TOKEN_NULL, 0);
+	else
+		json_kv_null(js, json_known_keys[id].key);
+}
+
+static inline void json_kv_float_id(struct json_state *js, enum json_key_id id, const char *fmt, double value)
+{
+	if (js->pool && !js->out.options.no_key_tokens) {
+		char *p = json_field_reserve(js, id, JSON_TOKEN_FLOAT, sizeof(fmt) + sizeof(value));
+
+		memcpy(p, &fmt, sizeof(fmt));
+		memcpy(p + sizeof(fmt), &value, sizeof(value));
+	} else {
+		json_kv_float(js, json_known_keys[id].key, fmt, value);
+	}
+}
+
+static inline void json_kv_ts_id(struct json_state *js, enum json_key_id id, u64 ns)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_data(js, id, JSON_TOKEN_TS, &ns, sizeof(ns));
+	else
+		json_kv_ts(js, json_known_keys[id].key, ns);
+}
+
+static inline void json_kv_bool_id(struct json_state *js, enum json_key_id id, bool value)
+{
+	if (js->pool && !js->out.options.no_key_tokens)
+		json_field_reserve(js, id, value ? JSON_TOKEN_TRUE : JSON_TOKEN_FALSE, 0);
+	else
+		json_kv_bool(js, json_known_keys[id].key, value);
 }

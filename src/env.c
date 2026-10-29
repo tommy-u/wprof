@@ -156,6 +156,7 @@ static const struct {
 	{ "integers", &env.json_no_int_format, false },
 	{ "timestamps", &env.json_no_int_ts, false },
 	{ "parallel", &env.json_no_parallel, false },
+	{ "key-tokens", &env.json_no_key_tokens, false },
 };
 
 static int set_json_optimization(const char *name, bool enabled)
@@ -194,7 +195,7 @@ static const struct argp_option opts[] = {
 	{ "trace", 'T', "FILE", 0, "Emit Perfetto trace to specified file (use '-' for stdout)" },
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
-	  "Enable JSON optimization: buffering, integers, timestamps, parallel, all (last setting wins)" },
+	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, all (last setting wins)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 

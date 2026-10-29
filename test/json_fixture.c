@@ -21,9 +21,9 @@ typedef uint64_t u64;
 int main(int argc, char **argv)
 {
 	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel" };
-	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel" };
+	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens" };
 	const size_t debug_optimization[] = { 0, 1, 2, 3 };
-	bool disabled[4] = { false };
+	bool disabled[5] = { false };
 	bool empty = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -35,13 +35,13 @@ int main(int argc, char **argv)
 			size_t optimization = 0;
 
 			if (strcmp(name, "all") == 0) {
-				for (size_t j = 0; j < 4; j++)
+				for (size_t j = 0; j < 5; j++)
 					disabled[j] = disable;
 				continue;
 			}
-			while (optimization < 4 && strcmp(name, optimizations[optimization]) != 0)
+			while (optimization < 5 && strcmp(name, optimizations[optimization]) != 0)
 				optimization++;
-			if (optimization == 4)
+			if (optimization == 5)
 				return 2;
 			disabled[optimization] = disable;
 		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
@@ -63,6 +63,7 @@ int main(int argc, char **argv)
 		.no_batching = disabled[0],
 		.no_int_format = disabled[1],
 		.no_int_ts = disabled[2],
+		.no_key_tokens = disabled[4],
 	};
 	js.no_parallel = disabled[3];
 	json_init(&js);
@@ -189,13 +190,22 @@ int main(int argc, char **argv)
 
 		for (int i = 0; i < 12000; i++) {
 			json_obj_start(&js);
+#ifdef JSON_REFERENCE
 			json_kv_int(&js, "id", i);
 			json_kv_ts(&js, "ts", 123456789ULL + i * 17ULL);
+#else
+			json_kv_int_id(&js, JSON_KEY_ID, i);
+			json_kv_ts_id(&js, JSON_KEY_TS, 123456789ULL + i * 17ULL);
+#endif
 			json_subarr_start(&js, "values");
 			json_arr_int(&js, -i);
 			json_arr_float(&js, "%.6lf", i / 7.0);
 			json_arr_end(&js);
+#ifdef JSON_REFERENCE
 			json_kv_fmt(&js, "name", "task-%d", i);
+#else
+			json_kv_fmt_id(&js, JSON_KEY_NAME, "task-%d", i);
+#endif
 			json_obj_end(&js);
 		}
 
