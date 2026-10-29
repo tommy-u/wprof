@@ -226,6 +226,8 @@ struct env {
 	char *data_path;
 	char *trace_path;
 	char *json_path;
+	size_t json_workers;
+	size_t json_batch_size;
 	enum seal_kind seals;		/* bitmask */
 
 	bool pb_debug_interns;
