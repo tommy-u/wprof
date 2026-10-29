@@ -21,10 +21,10 @@ typedef uint32_t u32;
 
 int main(int argc, char **argv)
 {
-	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel" };
-	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths", "task-tokens", "reuse", "worker-emitters" };
-	const size_t debug_optimization[] = { 0, 1, 2, 3 };
-	bool disabled[9] = { false };
+	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel", "json-no-writer" };
+	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths", "task-tokens", "reuse", "worker-emitters", "writer" };
+	const size_t debug_optimization[] = { 0, 1, 2, 3, 9 };
+	bool disabled[10] = { false };
 	bool empty = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -36,22 +36,22 @@ int main(int argc, char **argv)
 			size_t optimization = 0;
 
 			if (strcmp(name, "all") == 0) {
-				for (size_t j = 0; j < 9; j++)
+				for (size_t j = 0; j < 10; j++)
 					disabled[j] = disable;
 				continue;
 			}
-			while (optimization < 9 && strcmp(name, optimizations[optimization]) != 0)
+			while (optimization < 10 && strcmp(name, optimizations[optimization]) != 0)
 				optimization++;
-			if (optimization == 9)
+			if (optimization == 10)
 				return 2;
 			disabled[optimization] = disable;
 		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
 			const char *name = argv[++i];
 			size_t feature = 0;
 
-			while (feature < 4 && strcmp(name, features[feature]) != 0)
+			while (feature < 5 && strcmp(name, features[feature]) != 0)
 				feature++;
-			if (feature == 4)
+			if (feature == 5)
 				return 2;
 			disabled[debug_optimization[feature]] = true;
 		} else {
@@ -71,6 +71,7 @@ int main(int argc, char **argv)
 	js.no_parallel = disabled[3];
 	js.no_reuse = disabled[7];
 	js.no_worker_emitters = disabled[8];
+	js.no_writer = disabled[9];
 	json_init(&js);
 #else
 	(void)disabled;

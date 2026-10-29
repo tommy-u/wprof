@@ -5977,6 +5977,7 @@ int emit_trace(struct worker_state *w)
 			.no_task_tokens = env.json_no_task_tokens,
 		};
 		js.no_parallel = env.json_no_parallel;
+		js.no_writer = env.json_no_writer;
 		js.no_reuse = env.json_no_reuse;
 		js.no_worker_emitters = env.json_no_worker_emitters;
 		js.emit_ctx = w;

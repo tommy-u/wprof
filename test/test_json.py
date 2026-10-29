@@ -2,6 +2,7 @@
 """Compare default JSON bytes against the frozen original C serializer."""
 
 from decimal import Decimal
+import errno
 import hashlib
 import json
 import os
@@ -20,12 +21,12 @@ REFERENCE_BYTES = 7219740
 REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
 JSON_DEBUG_FEATURES = (
-    'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel',
+    'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel', 'json-no-writer',
 )
 
 
 JSON_OPTIMIZATIONS = (
-    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens', 'literal-lengths', 'task-tokens', 'reuse', 'worker-emitters',
+    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens', 'literal-lengths', 'task-tokens', 'reuse', 'worker-emitters', 'writer',
 )
 
 
@@ -65,6 +66,8 @@ class JsonOptionsTest(unittest.TestCase):
         result = subprocess.run([str(WPROF), "--help"], capture_output=True, check=True)
         for flag in (b"--fast-json", b"--json-workers", b"--json-batch-size"):
             self.assertNotIn(flag, result.stdout)
+        for feature in JSON_DEBUG_FEATURES:
+            self.assertIn(feature.encode(), result.stdout)
 
     def test_json_debug_features_are_accepted(self):
         for feature in JSON_DEBUG_FEATURES:
@@ -103,7 +106,7 @@ class JsonWriterTest(unittest.TestCase):
         build_dir = Path(cls.tmp.name)
         fixture_dir = build_dir / "test"
         fixture_dir.mkdir()
-        for name in ("json_fixture.c", "json_reference.h"):
+        for name in ("json_fixture.c", "json_reference.h", "json_writer.c"):
             shutil.copyfile(ROOT / "test" / name, fixture_dir / name)
         (build_dir / "src").symlink_to(SOURCE_DIR, target_is_directory=True)
 
@@ -123,8 +126,16 @@ class JsonWriterTest(unittest.TestCase):
             subprocess.run(command, check=True)
             cls.fixtures[mode] = fixture
 
-        cls.reference = subprocess.check_output([str(cls.fixtures["reference"])])
-        cls.output = subprocess.check_output([str(cls.fixtures["default"])])
+        cls.writer_fixture = build_dir / "writer"
+        subprocess.run([
+            *shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-O2", "-Wall", "-Wextra",
+            str(fixture_dir / "json_writer.c"), "-o", str(cls.writer_fixture),
+            str(SOURCE_DIR / "wrust/target/release/libwrust_c.a"),
+            "-Wl,--wrap=pthread_create", "-lpthread", "-ldl", "-lm",
+        ], check=True)
+
+        cls.reference = subprocess.check_output([str(cls.fixtures["reference"])], timeout=30)
+        cls.output = subprocess.check_output([str(cls.fixtures["default"])], timeout=30)
         cls.lines = cls.output.splitlines()
         cls.records = [json.loads(line, parse_float=Decimal) for line in cls.lines]
 
@@ -313,13 +324,40 @@ class JsonWriterTest(unittest.TestCase):
     def test_empty_stream(self):
         for mode, fixture in self.fixtures.items():
             with self.subTest(mode=mode):
-                self.assertEqual(subprocess.check_output([str(fixture), "--empty"]), b"")
+                self.assertEqual(subprocess.check_output([str(fixture), "--empty"], timeout=30), b"")
+        self.run_writer_fixture("empty")
+
+    def run_writer_fixture(self, mode):
+        result = subprocess.run(
+            [str(self.writer_fixture), mode], capture_output=True, timeout=30,
+        )
+        if result.returncode == 77:
+            self.skipTest(result.stdout.decode().strip())
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        return result
+
+    def test_gated_writer_backpressure_fifo_and_buffer_ownership(self):
+        self.run_writer_fixture("pipeline")
+
+    def test_writer_finish_drains_partial_batch(self):
+        self.run_writer_fixture("partial")
+
+    def test_writer_opt_out_and_serial_output_use_caller(self):
+        for mode in ("no-writer", "serial", "unbatched"):
+            with self.subTest(mode=mode):
+                self.run_writer_fixture(mode)
+
+    def test_writer_start_failure_reports_pthread_error_and_falls_back(self):
+        result = self.run_writer_fixture("start-failure")
+        self.assertIn(b"Failed to start JSON writer", result.stderr)
+        self.assertIn(os.strerror(errno.EAGAIN).encode(), result.stderr)
+        self.assertNotIn(os.strerror(errno.EPERM).encode(), result.stderr)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "/dev/full is required")
     def test_output_failure(self):
         for mode, fixture in self.fixtures.items():
             with self.subTest(mode=mode), open("/dev/full", "wb") as sink:
-                result = subprocess.run([str(fixture)], stdout=sink, stderr=subprocess.PIPE)
+                result = subprocess.run([str(fixture)], stdout=sink, stderr=subprocess.PIPE, timeout=30)
                 self.assertNotEqual(result.returncode, 0)
 
 
