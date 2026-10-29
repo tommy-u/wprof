@@ -193,6 +193,16 @@ struct json_writer_state {
 	size_t count;
 };
 
+struct json_job {
+	struct json_job *next;
+	char *batch;
+	size_t batch_len;
+	size_t batch_capacity;
+	struct json_options options;
+	struct json_buf out;
+	void *emit_ctx;
+};
+
 struct json_state {
 	struct json_buf out;
 	struct wpool *pool;
@@ -204,7 +214,9 @@ struct json_state {
 	struct sbuf *task_cache;
 	size_t task_cache_cnt;
 	struct wpool *pool;
+	struct json_job *free_jobs;
 	bool no_parallel;
+	bool no_reuse;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -225,13 +237,6 @@ struct json_emit_record {
 	size_t snapshot_len;
 };
 
-struct json_job {
-	char *batch;
-	size_t batch_len;
-	void *emit_ctx;
-	struct json_buf out;
-	struct json_options options;
-};
 
 static inline void json_float_stats_add(struct json_state *js, const struct json_buf *out)
 {
@@ -607,8 +612,16 @@ static inline void json_render(const char *data, size_t len, struct json_options
 	const unsigned char *p = (const unsigned char *)data;
 	const unsigned char *end = p + len;
 
-	*out = (struct json_buf) { .buffer = { .buf = malloc(JSON_BUF_SZ), .cap = JSON_BUF_SZ }, .options = options };
+	if (!out->buffer.buf) {
+		out->buffer.buf = malloc(JSON_BUF_SZ);
+		out->buffer.cap = JSON_BUF_SZ;
+	}
 	out->buffer.len = 0;
+	out->options = options;
+	out->float_zero_count = 0;
+	out->float_integer_count = 0;
+	out->float_fractional_count = 0;
+	out->float_fallback_count = 0;
 	struct json_state renderer = { .out = *out };
 
 	while (p < end) {
@@ -796,6 +809,18 @@ fail:
 	fprintf(stderr, "Failed to start JSON writer: %s; using synchronous writes\n", strerror(err));
 }
 
+static inline void json_job_release(struct json_state *js, struct json_job *job)
+{
+	if (js->no_reuse) {
+		free(job->batch);
+		free(job->out.buffer.buf);
+		free(job);
+	} else {
+		job->next = js->free_jobs;
+		js->free_jobs = job;
+	}
+}
+
 static inline void json_done(void *ctx, void *ptr)
 {
 	struct json_state *js = ctx;
@@ -817,20 +842,39 @@ static inline void json_done(void *ctx, void *ptr)
 		pthread_mutex_unlock(&writer->mutex);
 		return;
 	}
-	json_write_job(js, job);
+	fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f);
+	json_job_release(js, job);
 }
 
 static inline void json_submit(struct json_state *js)
 {
 	if (!js->batch_len)
 		return;
-	struct json_job *job = malloc(sizeof(*job));
+	struct json_job *job = js->free_jobs;
 
-	*job = (struct json_job) { .batch = js->batch, .batch_len = js->batch_len, .emit_ctx = js->emit_ctx, .options = js->out.options };
+	if (job)
+		js->free_jobs = job->next;
+	else
+		job = calloc(1, sizeof(*job));
+	job->next = NULL;
+	job->batch = js->batch;
+	job->batch_len = js->batch_len;
+	job->batch_capacity = js->batch_capacity;
+	job->options = js->out.options;
+	job->emit_ctx = js->emit_ctx;
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
 	wpool_submit(js->pool, job);
+	/* A full pool retires a written job during submit; reuse its batch for the producer. */
+	job = js->free_jobs;
+	if (!js->no_reuse && job) {
+		js->batch = job->batch;
+		js->batch_capacity = job->batch_capacity;
+		job->batch = NULL;
+		job->batch_len = 0;
+		job->batch_capacity = 0;
+	}
 }
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
@@ -1010,7 +1054,15 @@ static inline void json_finish(struct json_state *js)
 			writer->started = false;
 		}
 		free(js->batch);
-	} else if (js->out.buffer.len) {
+		while (js->free_jobs) {
+			struct json_job *job = js->free_jobs;
+
+			js->free_jobs = job->next;
+			free(job->batch);
+			free(job->out.buffer.buf);
+			free(job);
+		}
+	} else {
 		json_flush(js);
 	}
 	sbuf_free(&js->out.buffer);

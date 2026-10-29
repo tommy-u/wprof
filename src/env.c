@@ -159,6 +159,7 @@ static const struct {
 	{ "key-tokens", &env.json_no_key_tokens, false },
 	{ "literal-lengths", &env.json_no_literal_lengths, false },
 	{ "task-tokens", &env.json_no_task_tokens, false },
+	{ "reuse", &env.json_no_reuse, false },
 };
 
 static int set_json_optimization(const char *name, bool enabled)
@@ -198,7 +199,7 @@ static const struct argp_option opts[] = {
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
-	  "task-tokens, all (last setting wins)" },
+	  "task-tokens, reuse, all (last setting wins)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 
