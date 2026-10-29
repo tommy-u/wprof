@@ -27,7 +27,7 @@
 
 static __thread struct json_state js;
 
-static void json_render_event(struct json_state *out, void *ctx, const void *event, const void *snapshot);
+static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out);
 
 _Static_assert(IID_NAME_TASK_STATE_LAST - IID_NAME_RUNNING + 1 == NR_WPROF_TASK_RUN_STATES,
 	       "task-state name IIDs must match enum wprof_task_run_state");
@@ -2380,7 +2380,7 @@ static int process_switch(struct worker_state *w, const struct wevent *e)
 				.compound_chain_len = s.next_st ? s.next_st->compound_chain_len : 0,
 			};
 
-			if (js.pool)
+			if (js.pool && !js.no_worker_emitters)
 				memcpy(json_emit_reserve(&js, json_render_event, e, sizeof(snapshot)), &snapshot, sizeof(snapshot));
 			else
 				emit_switch_json(w, e, &snapshot);
@@ -2814,7 +2814,7 @@ emit:
 	if (!trace_waker)
 		return 0;
 	if (env.json_path) {
-		if (js.pool)
+		if (js.pool && !js.no_worker_emitters)
 			json_emit_reserve(&js, json_render_event, e, 0);
 		else
 			emit_waking_json(w, e, flags);
@@ -2886,7 +2886,7 @@ static int process_hardirq_exit(struct worker_state *w, const struct wevent *e)
 		return 0;
 
 	if (env.json_path) {
-		if (js.pool)
+		if (js.pool && !js.no_worker_emitters)
 			json_emit_reserve(&js, json_render_event, e, 0);
 		else
 			emit_hardirq_exit_json(w, e);
@@ -2966,7 +2966,7 @@ static int process_softirq_exit(struct worker_state *w, const struct wevent *e)
 		return 0;
 
 	if (env.json_path) {
-		if (js.pool)
+		if (js.pool && !js.no_worker_emitters)
 			json_emit_reserve(&js, json_render_event, e, 0);
 		else
 			emit_softirq_exit_json(w, e);
@@ -3713,7 +3713,7 @@ static int process_req_event(struct worker_state *w, const struct wevent *e)
 	}
 
 	if (env.json_path) {
-		if (js.pool)
+		if (js.pool && !js.no_worker_emitters)
 			json_queue_req(e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
 		else
 			emit_req_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
@@ -4089,7 +4089,7 @@ static int process_req_task_event(struct worker_state *w, const struct wevent *e
 	}
 
 	if (env.json_path) {
-		if (js.pool)
+		if (js.pool && !js.no_worker_emitters)
 			json_queue_req(e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
 		else
 			emit_req_task_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
@@ -4099,12 +4099,12 @@ static int process_req_task_event(struct worker_state *w, const struct wevent *e
 	return 0;
 }
 
-static void json_render_event(struct json_state *out, void *ctx, const void *event, const void *snapshot)
+static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out)
 {
 	struct worker_state *w = ctx;
 	const struct wevent *e = event;
 
-	js = (struct json_state) { .out = out->out, .lvl = -1 };
+	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
 	switch (e->kind) {
 	case EV_SWITCH: {
 		struct json_switch_snapshot s;
@@ -4145,7 +4145,7 @@ static void json_render_event(struct json_state *out, void *ctx, const void *eve
 	default:
 		BUG("unhandled deferred JSON event %d\n", e->kind);
 	}
-	out->out = js.out;
+	*out = js.out;
 	sfmt_reset();
 }
 
@@ -6039,6 +6039,8 @@ int emit_trace(struct worker_state *w)
 		};
 		js.no_parallel = env.json_no_parallel;
 		js.no_reuse = env.json_no_reuse;
+		js.no_worker_emitters = env.json_no_worker_emitters;
+		js.emit_ctx = w;
 		json_init(&js);
 		emit_header_json(w);
 		if (env.requested_stack_traces)
