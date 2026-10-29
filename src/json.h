@@ -6,6 +6,9 @@
 
 #define JSON_FLUSH_SZ (1024 * 1024)
 
+#include <pthread.h>
+#include <sys/prctl.h>
+
 #include "wrust.h"
 
 /*
@@ -213,6 +216,22 @@ struct json_job {
 	void *emit_ctx;
 };
 
+struct json_writer_state {
+	bool started;
+	bool closing;
+	pthread_t thread;
+	pthread_mutex_t mutex;
+	pthread_cond_t work;
+	pthread_cond_t space;
+	struct json_job *queue[2];
+	size_t head;
+	size_t count;
+	u64 float_zero_count;
+	u64 float_integer_count;
+	u64 float_fractional_count;
+	u64 float_fallback_count;
+};
+
 struct json_state {
 	struct json_buf out;
 	struct wpool *pool;
@@ -225,8 +244,10 @@ struct json_state {
 	size_t task_cache_cnt;
 	struct wpool *pool;
 	struct json_job *free_jobs;
+	struct json_writer_state writer;
 	void *emit_ctx;
 	bool no_parallel;
+	bool no_writer;
 	bool no_reuse;
 	bool no_worker_emitters;
 	char *batch;
@@ -241,15 +262,12 @@ struct json_state {
 	u64 float_fallback_count;
 };
 
-
-
-
-static inline void json_float_stats_add(struct json_state *js, const struct json_buf *out)
+static inline void json_float_stats_add(struct json_state *js, const struct json_writer_state *writer)
 {
-	js->float_zero_count += out->float_zero_count;
-	js->float_integer_count += out->float_integer_count;
-	js->float_fractional_count += out->float_fractional_count;
-	js->float_fallback_count += out->float_fallback_count;
+	js->float_zero_count += writer->float_zero_count;
+	js->float_integer_count += writer->float_integer_count;
+	js->float_fractional_count += writer->float_fractional_count;
+	js->float_fallback_count += writer->float_fallback_count;
 }
 
 #define JSON_STATE_INIT(file) { .out = { .f = (file) }, .lvl = -1 }
@@ -837,16 +855,81 @@ static inline void json_job_release(struct json_state *js, struct json_job *job)
 	}
 }
 
+static inline void json_write_job(void *ctx, void *ptr)
+{
+	struct json_state *js = ctx;
+	struct json_writer_state *writer = &js->writer;
+	struct json_job *job = ptr;
+
+	writer->float_zero_count += job->out.float_zero_count;
+	writer->float_integer_count += job->out.float_integer_count;
+	writer->float_fractional_count += job->out.float_fractional_count;
+	writer->float_fallback_count += job->out.float_fallback_count;
+	fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f);
+}
+
+static void *json_writer_main(void *ctx)
+{
+	struct json_state *js = ctx;
+	struct json_writer_state *writer = &js->writer;
+
+	prctl(PR_SET_NAME, "wprof_json_io", 0, 0, 0);
+	pthread_mutex_lock(&writer->mutex);
+	for (;;) {
+		while (!writer->count && !writer->closing)
+			pthread_cond_wait(&writer->work, &writer->mutex);
+		if (!writer->count)
+			break;
+		struct json_job *job = writer->queue[writer->head];
+
+		writer->queue[writer->head] = NULL;
+		writer->head = (writer->head + 1) % 2;
+		writer->count--;
+		pthread_cond_signal(&writer->space);
+		pthread_mutex_unlock(&writer->mutex);
+		/* Keep draining after a failed write so producers cannot stay blocked. */
+		json_write_job(js, job);
+		pthread_mutex_lock(&writer->mutex);
+		json_job_release(js, job);
+	}
+	pthread_mutex_unlock(&writer->mutex);
+	return NULL;
+}
+
+static inline void json_writer_start(struct json_state *js)
+{
+	struct json_writer_state *writer = &js->writer;
+	int err = pthread_mutex_init(&writer->mutex, NULL);
+
+	if (err)
+		goto fail;
+	err = pthread_cond_init(&writer->work, NULL);
+	if (err)
+		goto destroy_mutex;
+	err = pthread_cond_init(&writer->space, NULL);
+	if (err)
+		goto destroy_work;
+	err = pthread_create(&writer->thread, NULL, json_writer_main, js);
+	if (err)
+		goto destroy_space;
+	writer->started = true;
+	return;
+
+destroy_space:
+	pthread_cond_destroy(&writer->space);
+destroy_work:
+	pthread_cond_destroy(&writer->work);
+destroy_mutex:
+	pthread_mutex_destroy(&writer->mutex);
+fail:
+	fprintf(stderr, "Failed to start JSON writer: %s; using synchronous writes\n", strerror(err));
+}
+
 static inline void json_done(void *ctx, void *ptr)
 {
 	struct json_state *js = ctx;
 	struct json_job *job = ptr;
 	struct json_writer_state *writer = &js->writer;
-
-	js->float_zero_count += job->out.float_zero_count;
-	js->float_integer_count += job->out.float_integer_count;
-	js->float_fractional_count += job->out.float_fractional_count;
-	js->float_fallback_count += job->out.float_fallback_count;
 
 	if (writer->started) {
 		pthread_mutex_lock(&writer->mutex);
@@ -858,7 +941,7 @@ static inline void json_done(void *ctx, void *ptr)
 		pthread_mutex_unlock(&writer->mutex);
 		return;
 	}
-	fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f);
+	json_write_job(js, job);
 	json_job_release(js, job);
 }
 
@@ -866,30 +949,47 @@ static inline void json_submit(struct json_state *js)
 {
 	if (!js->batch_len)
 		return;
+	struct json_writer_state *writer = &js->writer;
+
+	if (writer->started)
+		pthread_mutex_lock(&writer->mutex);
 	struct json_job *job = js->free_jobs;
 
 	if (job)
 		js->free_jobs = job->next;
-	else
+	if (writer->started)
+		pthread_mutex_unlock(&writer->mutex);
+	if (!job)
 		job = calloc(1, sizeof(*job));
+	/* A recycled job can still own a batch; preserve it before replacing the submitted buffer. */
+	char *spare = job->batch;
+	size_t spare_capacity = job->batch_capacity;
+
 	job->next = NULL;
 	job->batch = js->batch;
 	job->batch_len = js->batch_len;
 	job->batch_capacity = js->batch_capacity;
 	job->options = js->out.options;
 	job->emit_ctx = js->emit_ctx;
-	js->batch = NULL;
+	js->batch = spare;
 	js->batch_len = 0;
-	js->batch_capacity = 0;
+	js->batch_capacity = spare_capacity;
 	wpool_submit(js->pool, job);
-	/* A full pool retires a written job during submit; reuse its batch for the producer. */
-	job = js->free_jobs;
-	if (!js->no_reuse && job) {
-		js->batch = job->batch;
-		js->batch_capacity = job->batch_capacity;
-		job->batch = NULL;
-		job->batch_len = 0;
-		job->batch_capacity = 0;
+	/* A full pool retires a job during submit; borrow a written batch if we don't already have a spare. */
+	if (!js->no_reuse && !js->batch) {
+		if (writer->started)
+			pthread_mutex_lock(&writer->mutex);
+		for (job = js->free_jobs; job && !job->batch; job = job->next)
+			;
+		if (job) {
+			js->batch = job->batch;
+			js->batch_capacity = job->batch_capacity;
+			job->batch = NULL;
+			job->batch_len = 0;
+			job->batch_capacity = 0;
+		}
+		if (writer->started)
+			pthread_mutex_unlock(&writer->mutex);
 	}
 }
 
@@ -1047,7 +1147,12 @@ static inline void json_init(struct json_state *js)
 	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
-		json_writer_start(js);
+		if (!js->no_writer)
+			json_writer_start(js);
+	} else if (!js->out.options.no_batching) {
+		js->out.buffer.buf = malloc(JSON_BUF_SZ);
+		js->out.buffer.cap = JSON_BUF_SZ;
+		js->out.buffer.len = 0;
 	}
 }
 
@@ -1064,19 +1169,28 @@ static inline void json_finish(struct json_state *js)
 			pthread_cond_signal(&writer->work);
 			pthread_mutex_unlock(&writer->mutex);
 			pthread_join(writer->thread, NULL);
+		}
+		free(js->batch);
+		if (writer->started)
+			pthread_mutex_lock(&writer->mutex);
+		struct json_job *job = js->free_jobs;
+
+		js->free_jobs = NULL;
+		if (writer->started)
+			pthread_mutex_unlock(&writer->mutex);
+		while (job) {
+			struct json_job *next = job->next;
+
+			free(job->batch);
+			free(job->out.buffer.buf);
+			free(job);
+			job = next;
+		}
+		if (writer->started) {
 			pthread_cond_destroy(&writer->space);
 			pthread_cond_destroy(&writer->work);
 			pthread_mutex_destroy(&writer->mutex);
 			writer->started = false;
-		}
-		free(js->batch);
-		while (js->free_jobs) {
-			struct json_job *job = js->free_jobs;
-
-			js->free_jobs = job->next;
-			free(job->batch);
-			free(job->out.buffer.buf);
-			free(job);
 		}
 	} else {
 		json_flush(js);
@@ -1085,6 +1199,7 @@ static inline void json_finish(struct json_state *js)
 	for (size_t i = 0; i < js->task_cache_cnt; i++)
 		sbuf_free(&js->task_cache[i]);
 	free(js->task_cache);
+	json_float_stats_add(js, &js->writer);
 	if (js->float_zero_count + js->float_integer_count + js->float_fractional_count + js->float_fallback_count)
 		fprintf(stderr, "JSON float paths: zero=%llu integer=%llu fractional=%llu printf=%llu\n",
 			(unsigned long long)js->float_zero_count,
