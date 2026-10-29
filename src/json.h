@@ -1,5 +1,13 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/magic.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
+#include <unistd.h>
 
 #include "wrust.h"
 
@@ -194,7 +202,19 @@ struct json_job {
 struct json_writer_state {
 	bool started;
 	bool closing;
+	bool direct_active;
+	bool nocow_active;
+	bool fd_flags_changed;
 	pthread_t thread;
+	int fd;
+	int original_fd_flags;
+	int error;
+	off_t logical_size;
+	off_t direct_offset;
+	char *direct_data;
+	size_t direct_len;
+	unsigned long long direct_bytes;
+	unsigned long long direct_writes;
 	pthread_mutex_t mutex;
 	pthread_cond_t work;
 	pthread_cond_t space;
@@ -213,6 +233,8 @@ struct json_state {
 	bool no_writer;
 	bool no_reuse;
 	bool no_worker_emitters;
+	bool direct_io;
+	bool nocow;
 	size_t max_workers;
 	size_t batch_size;
 	char *batch;
@@ -228,6 +250,10 @@ struct json_state {
 #ifndef JSON_BUF_SZ
 #define JSON_BUF_SZ (1024 * 1024)
 #endif
+
+#define JSON_DIRECT_ALIGN 4096
+#define JSON_DIRECT_MEM_ALIGN (2 * 1024 * 1024)
+#define JSON_DIRECT_CHUNK_SZ (4 * 1024 * 1024)
 
 static inline void json_flush(struct json_buf *b)
 {
@@ -602,6 +628,206 @@ static inline void json_work(void *ctx, void *ptr)
 	json_render(job->batch, job->batch_len, job->options, &job->out, job->emit_ctx);
 }
 
+static inline void json_direct_fallback(const char *reason)
+{
+	fprintf(stderr, "JSON direct I/O: buffered_fallback=1 reason=%s\n", reason);
+}
+
+static inline const char *json_btrfs_output(struct json_state *js, struct statfs *fs)
+{
+	struct stat st;
+	int fd = js->writer.fd;
+
+	if (js->out.f == stdout || fd < 0)
+		return "output is not a named regular file";
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_nlink)
+		return "output is not a named regular file";
+	if (st.st_size || ftello(js->out.f) != 0)
+		return "output file must be empty";
+	if (fstatfs(fd, fs) || fs->f_type != BTRFS_SUPER_MAGIC)
+		return "output filesystem is not Btrfs";
+	return NULL;
+}
+
+static inline void json_nocow_prepare(struct json_state *js)
+{
+	struct json_writer_state *writer = &js->writer;
+	struct statfs fs;
+	const char *reason = json_btrfs_output(js, &fs);
+	int original_flags, flags, ret;
+	bool changed = false;
+
+	if (reason)
+		goto fallback;
+	if (ioctl(writer->fd, FS_IOC_GETFLAGS, &original_flags)) {
+		reason = "cannot read Btrfs output file flags";
+		goto fallback;
+	}
+	flags = (original_flags | FS_NOCOW_FL) & ~FS_COMPR_FL;
+	if (flags != original_flags) {
+		do {
+			ret = ioctl(writer->fd, FS_IOC_SETFLAGS, &flags);
+		} while (ret && errno == EINTR);
+		if (ret) {
+			reason = "cannot enable NOCOW on output file";
+			goto fallback;
+		}
+		changed = true;
+	}
+	if (ioctl(writer->fd, FS_IOC_GETFLAGS, &flags) || !(flags & FS_NOCOW_FL) || (flags & FS_COMPR_FL)) {
+		reason = "NOCOW output file flags were not applied";
+		if (changed) {
+			do {
+				ret = ioctl(writer->fd, FS_IOC_SETFLAGS, &original_flags);
+			} while (ret && errno == EINTR);
+			if (ret) {
+				writer->error = errno;
+				fprintf(stderr, "Failed to restore JSON output file flags: %s\n", strerror(writer->error));
+			}
+		}
+		goto fallback;
+	}
+	writer->nocow_active = true;
+	fprintf(stderr, "JSON NOCOW: enabled nocow=1\n");
+	return;
+
+fallback:
+	fprintf(stderr, "JSON NOCOW: enabled=0 reason=%s\n", reason);
+}
+
+static inline void json_direct_restore_fd(struct json_writer_state *writer)
+{
+	if (!writer->fd_flags_changed)
+		return;
+	int ret;
+
+	do {
+		ret = fcntl(writer->fd, F_SETFL, writer->original_fd_flags);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		if (!writer->error)
+			writer->error = errno;
+	} else {
+		writer->fd_flags_changed = false;
+	}
+}
+
+static inline void json_direct_rollback(struct json_writer_state *writer)
+{
+	json_direct_restore_fd(writer);
+	free(writer->direct_data);
+	writer->direct_data = NULL;
+	writer->direct_active = false;
+}
+
+static inline void json_direct_start(struct json_state *js)
+{
+	struct json_writer_state *writer = &js->writer;
+	const char *reason;
+#ifdef O_DIRECT
+	struct statfs fs;
+	int flags, ret;
+
+	reason = json_btrfs_output(js, &fs);
+	if (reason)
+		goto fallback;
+	/* Btrfs reports its sector size here; statx can impose additional DIO alignment. */
+	if (fs.f_bsize <= 0 || JSON_DIRECT_ALIGN % fs.f_bsize) {
+		reason = "filesystem alignment exceeds 4096 bytes";
+		goto fallback;
+	}
+#ifdef STATX_DIOALIGN
+	struct statx sx;
+
+	if (!statx(writer->fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) && (sx.stx_mask & STATX_DIOALIGN)) {
+		if (!sx.stx_dio_mem_align || !sx.stx_dio_offset_align ||
+		    JSON_DIRECT_MEM_ALIGN % sx.stx_dio_mem_align || JSON_DIRECT_ALIGN % sx.stx_dio_mem_align ||
+		    JSON_DIRECT_ALIGN % sx.stx_dio_offset_align) {
+			reason = "kernel direct I/O alignment is incompatible";
+			goto fallback;
+		}
+	}
+#endif
+	writer->original_fd_flags = fcntl(writer->fd, F_GETFL);
+	if (writer->original_fd_flags < 0 || (writer->original_fd_flags & O_APPEND)) {
+		reason = "output descriptor flags are incompatible";
+		goto fallback;
+	}
+	if (fflush(js->out.f)) {
+		reason = "cannot synchronize output stream";
+		goto fallback;
+	}
+	ret = posix_memalign((void **)&writer->direct_data, JSON_DIRECT_MEM_ALIGN, JSON_DIRECT_CHUNK_SZ);
+	if (ret) {
+		reason = "cannot allocate aligned staging buffer";
+		goto fallback;
+	}
+	if (ioctl(writer->fd, FS_IOC_GETFLAGS, &flags)) {
+		reason = "cannot read Btrfs output file flags";
+		goto fallback;
+	}
+	writer->nocow_active = !!(flags & FS_NOCOW_FL);
+	do {
+		ret = fcntl(writer->fd, F_SETFL, writer->original_fd_flags | O_DIRECT);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		reason = "cannot enable O_DIRECT on output descriptor";
+		goto fallback;
+	}
+	writer->fd_flags_changed = true;
+	writer->direct_active = true;
+	return;
+#else
+	reason = "build does not expose O_DIRECT";
+#endif
+fallback:
+	json_direct_rollback(writer);
+	json_direct_fallback(reason);
+}
+
+static inline void json_direct_write(struct json_writer_state *writer, size_t len)
+{
+	const char *data = writer->direct_data;
+
+	while (len) {
+		ssize_t ret = pwrite(writer->fd, data, len, writer->direct_offset);
+
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret <= 0) {
+			writer->error = ret < 0 ? errno : EIO;
+			return;
+		}
+		writer->direct_bytes += ret;
+		writer->direct_writes++;
+		writer->direct_offset += ret;
+		if (ret % JSON_DIRECT_ALIGN) {
+			writer->error = EIO;
+			return;
+		}
+		data += ret;
+		len -= ret;
+	}
+}
+
+static inline void json_direct_pack(struct json_writer_state *writer, const char *data, size_t len)
+{
+	while (len && !writer->error) {
+		size_t n = JSON_DIRECT_CHUNK_SZ - writer->direct_len;
+
+		if (n > len)
+			n = len;
+		memcpy(writer->direct_data + writer->direct_len, data, n);
+		writer->direct_len += n;
+		data += n;
+		len -= n;
+		if (writer->direct_len == JSON_DIRECT_CHUNK_SZ) {
+			json_direct_write(writer, writer->direct_len);
+			writer->direct_len = 0;
+		}
+	}
+}
+
 static inline void json_job_release(struct json_state *js, struct json_job *job)
 {
 	if (js->no_reuse) {
@@ -634,17 +860,31 @@ static void *json_writer_main(void *ctx)
 		pthread_cond_signal(&writer->space);
 		pthread_mutex_unlock(&writer->mutex);
 		/* Keep draining after a failed write so producers cannot stay blocked. */
-		fwrite(job->out.data, 1, job->out.len, js->out.f);
+		if (!writer->error) {
+			writer->logical_size += job->out.len;
+			if (writer->direct_active) {
+				json_direct_pack(writer, job->out.data, job->out.len);
+			} else {
+				fwrite(job->out.data, 1, job->out.len, js->out.f);
+			}
+		}
 		pthread_mutex_lock(&writer->mutex);
 		json_job_release(js, job);
 	}
 	pthread_mutex_unlock(&writer->mutex);
+	if (writer->direct_active && !writer->error && writer->direct_len) {
+		size_t len = (writer->direct_len + JSON_DIRECT_ALIGN - 1) / JSON_DIRECT_ALIGN * JSON_DIRECT_ALIGN;
+
+		memset(writer->direct_data + writer->direct_len, 0, len - writer->direct_len);
+		json_direct_write(writer, len);
+	}
 	return NULL;
 }
 
 static inline void json_writer_start(struct json_state *js)
 {
 	struct json_writer_state *writer = &js->writer;
+	writer->fd = fileno(js->out.f);
 	int err = pthread_mutex_init(&writer->mutex, NULL);
 
 	if (err)
@@ -655,10 +895,18 @@ static inline void json_writer_start(struct json_state *js)
 	err = pthread_cond_init(&writer->space, NULL);
 	if (err)
 		goto destroy_work;
+	if (js->direct_io)
+		json_direct_start(js);
 	err = pthread_create(&writer->thread, NULL, json_writer_main, js);
-	if (err)
+	if (err) {
+		if (writer->direct_active)
+			json_direct_rollback(writer);
 		goto destroy_space;
+	}
 	writer->started = true;
+	if (writer->direct_active)
+		fprintf(stderr, "JSON direct I/O: enabled alignment=%d chunk=%d nocow=%d\n",
+			JSON_DIRECT_ALIGN, JSON_DIRECT_CHUNK_SZ, writer->nocow_active);
 	return;
 
 destroy_space:
@@ -669,6 +917,8 @@ destroy_mutex:
 	pthread_mutex_destroy(&writer->mutex);
 fail:
 	fprintf(stderr, "Failed to start JSON writer: %s; using synchronous writes\n", strerror(err));
+	if (js->direct_io)
+		json_direct_fallback("dedicated JSON writer could not start");
 }
 
 static inline void json_done(void *ctx, void *ptr)
@@ -687,7 +937,8 @@ static inline void json_done(void *ctx, void *ptr)
 		pthread_mutex_unlock(&writer->mutex);
 		return;
 	}
-	fwrite(job->out.data, 1, job->out.len, js->out.f);
+	if (!writer->error)
+		fwrite(job->out.data, 1, job->out.len, js->out.f);
 	json_job_release(js, job);
 }
 
@@ -866,6 +1117,10 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 
 static inline void json_init(struct json_state *js)
 {
+	if (js->nocow || js->direct_io)
+		js->writer.fd = fileno(js->out.f);
+	if (js->nocow)
+		json_nocow_prepare(js);
 	if (!js->out.options.no_batching && !js->no_parallel)
 		js->pool = wpool_new(js->max_workers, json_work, json_done, js);
 	if (js->pool) {
@@ -873,17 +1128,21 @@ static inline void json_init(struct json_state *js)
 		js->batch_capacity = js->batch_size;
 		if (!js->no_writer)
 			json_writer_start(js);
+		else if (js->direct_io)
+			json_direct_fallback("dedicated JSON writer is disabled");
 	} else if (!js->out.options.no_batching) {
 		js->out.data = malloc(JSON_BUF_SZ);
 		js->out.capacity = JSON_BUF_SZ;
 	}
+	if (!js->pool && js->direct_io)
+		json_direct_fallback("parallel JSON writer is unavailable");
 }
 
-static inline void json_finish(struct json_state *js)
+static inline int json_finish(struct json_state *js)
 {
-	if (js->pool) {
-		struct json_writer_state *writer = &js->writer;
+	struct json_writer_state *writer = &js->writer;
 
+	if (js->pool) {
 		json_submit(js);
 		wpool_finish(js->pool);
 		if (writer->started) {
@@ -892,6 +1151,23 @@ static inline void json_finish(struct json_state *js)
 			pthread_cond_signal(&writer->work);
 			pthread_mutex_unlock(&writer->mutex);
 			pthread_join(writer->thread, NULL);
+			if (writer->direct_active) {
+				/* The aligned last write can extend EOF; expose only the actual JSON bytes. */
+				if (!writer->error) {
+					int ret;
+
+					do {
+						ret = ftruncate(writer->fd, writer->logical_size);
+					} while (ret && errno == EINTR);
+					if (ret)
+						writer->error = errno;
+				}
+				json_direct_restore_fd(writer);
+				if (fseeko(js->out.f, writer->logical_size, SEEK_SET) && !writer->error)
+					writer->error = errno;
+				free(writer->direct_data);
+				writer->direct_data = NULL;
+			}
 		}
 		free(js->batch);
 		if (writer->started)
@@ -919,6 +1195,12 @@ static inline void json_finish(struct json_state *js)
 		json_flush(&js->out);
 		free(js->out.data);
 	}
+	if (js->direct_io) {
+		fprintf(stderr, "JSON direct I/O: %s direct_bytes=%llu direct_writes=%llu logical_bytes=%llu buffered_fallback=%d\n",
+			writer->error ? "failed" : "completed", writer->direct_bytes, writer->direct_writes,
+			(unsigned long long)writer->logical_size, !writer->direct_active);
+	}
+	return -writer->error;
 }
 
 static inline void json_vprintf_id(struct json_state *js, enum json_key_id id, const char *fmt, va_list ap)

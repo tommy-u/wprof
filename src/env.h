@@ -242,6 +242,8 @@ struct env {
 	bool json_no_task_tokens;
 	bool json_no_reuse;
 	bool json_no_worker_emitters;
+	bool json_direct_io;
+	bool json_nocow;
 	bool keep_workdir;
 	bool raw_stacks;
 	bool no_tsidx;		/* replay: ignore the timestamp index, force full walk */

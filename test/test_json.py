@@ -42,8 +42,10 @@ class JsonOptionsTest(unittest.TestCase):
     def test_help_describes_json_tuning_and_debug_features(self):
         result = subprocess.run([str(WPROF), "--help"], capture_output=True, check=True)
         self.assertNotIn(b"--fast-json", result.stdout)
-        for flag in (b"--json-workers", b"--json-batch-size", b"--json-opt", b"--no-json-opt"):
+        for flag in (b"--json-workers", b"--json-batch-size", b"--json-direct-io", b"--json-opt", b"--no-json-opt"):
             self.assertIn(flag, result.stdout)
+        self.assertIn(b"checksums", result.stdout)
+        self.assertIn(b"compression", result.stdout)
         for feature in JSON_DEBUG_FEATURES:
             self.assertIn(feature.encode(), result.stdout)
 
@@ -82,6 +84,15 @@ class JsonOptionsTest(unittest.TestCase):
                     self.assertNotIn(b"unrecognized option", result.stderr)
                     self.assertNotIn(b"Invalid --json", result.stderr)
                     self.assertIn(b"/missing-json-test.data", result.stderr)
+
+    def test_direct_io_flag_is_accepted_before_opening_data(self):
+        result = subprocess.run(
+            [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--json-direct-io"],
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(b"unrecognized option", result.stderr)
+        self.assertIn(b"/missing-json-test.data", result.stderr)
 
     def test_invalid_json_tuning_values_report_the_flag_and_range(self):
         for flag, values, range_text in (

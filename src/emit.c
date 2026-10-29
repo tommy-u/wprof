@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2025 Meta Platforms, Inc. */
+#define _GNU_SOURCE
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -5980,6 +5981,8 @@ int emit_trace(struct worker_state *w)
 		js.no_writer = env.json_no_writer;
 		js.no_reuse = env.json_no_reuse;
 		js.no_worker_emitters = env.json_no_worker_emitters;
+		js.direct_io = env.json_direct_io;
+		js.nocow = env.json_nocow;
 		if (env.json_workers)
 			js.max_workers = env.json_workers;
 		if (env.json_batch_size)
@@ -6018,8 +6021,15 @@ int emit_trace(struct worker_state *w)
 	}
 
 	err = process_events(w, emit_fns, ARRAY_SIZE(emit_fns));
-	if (env.json_path)
-		json_finish(&js);
+	if (env.json_path) {
+		int write_err = json_finish(&js);
+
+		if (write_err) {
+			eprintf("Failed to write trace file '%s': %s\n", env.json_path, strerror(-write_err));
+			if (!err)
+				err = write_err;
+		}
+	}
 	if (err)
 		return err;
 
