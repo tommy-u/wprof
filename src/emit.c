@@ -27,6 +27,8 @@
 
 static __thread struct json_state js;
 
+static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out);
+
 _Static_assert(IID_NAME_TASK_STATE_LAST - IID_NAME_RUNNING + 1 == NR_WPROF_TASK_RUN_STATES,
 	       "task-state name IIDs must match enum wprof_task_run_state");
 _Static_assert(IID_ANNV_OFFCPU_STATE_LAST - IID_ANNV_OFFCPU_STATE + 1 == NR_WPROF_TASK_RUN_STATES,
@@ -1992,6 +1994,20 @@ struct switch_ctx {
 	enum wprof_task_run_state next_state;
 };
 
+struct json_switch_snapshot {
+	bool has_waking;
+	u64 waking_ts;
+	u32 waker_task_id;
+	u16 waker_cpu;
+	enum waking_flags waking_flags;
+	enum wprof_task_run_state prev_state, next_state;
+	u64 next_offcpu_dur_ns;
+	const struct pmu_val *prev_oncpu_ctrs;
+	u64 prev_oncpu_ts;
+	const struct pmu_val *pmu_vals;
+	u64 compound_delay_ns, compound_chain_len;
+};
+
 static void emit_switch(struct worker_state *w, const struct wevent *e, struct switch_ctx *s)
 {
 	struct wprof_data_hdr *hdr = w->dump_hdr;
@@ -2177,7 +2193,7 @@ skip_sched_view:
 	;
 }
 
-static void emit_switch_json(struct worker_state *w, const struct wevent *e, struct switch_ctx *s)
+static void emit_switch_json(struct worker_state *w, const struct wevent *e, const struct json_switch_snapshot *s)
 {
 	struct json_state *j = &js;
 	struct wprof_data_hdr *hdr = w->dump_hdr;
@@ -2209,9 +2225,9 @@ static void emit_switch_json(struct worker_state *w, const struct wevent *e, str
 	}
 	if ((env.requested_stack_traces & ST_OFFCPU) && e->swtch.offcpu_stack_id > 0)
 		json_kv_int_id(j, JSON_KEY_OFFCPU_STACK_ID, e->swtch.pystack_id ?: e->swtch.offcpu_stack_id);
-	if (s->next_st && s->next_st->compound_delay_ns) {
-		json_kv_ts_id(j, JSON_KEY_COMPOUND_DELAY, s->next_st->compound_delay_ns);
-		json_kv_int_id(j, JSON_KEY_COMPOUND_CHAIN_LEN, s->next_st->compound_chain_len);
+	if (s->compound_delay_ns) {
+		json_kv_ts_id(j, JSON_KEY_COMPOUND_DELAY, s->compound_delay_ns);
+		json_kv_int_id(j, JSON_KEY_COMPOUND_CHAIN_LEN, s->compound_chain_len);
 	}
 	json_pmu_counters(j, s->prev_oncpu_ctrs, s->pmu_vals, false,
 			  s->prev_oncpu_ts ? e->ts - s->prev_oncpu_ts : 0);
@@ -2328,8 +2344,28 @@ static int process_switch(struct worker_state *w, const struct wevent *e)
 	}
 
 	if (env.json_path) {
-		if (s.trace_prev || s.trace_next)
-			emit_switch_json(w, e, &s);
+		if (s.trace_prev || s.trace_next) {
+			struct json_switch_snapshot snapshot = {
+				.has_waking = s.has_waking,
+				.waking_ts = s.waking_ts,
+				.waker_task_id = s.waker_task_id,
+				.waker_cpu = s.waker_cpu,
+				.waking_flags = s.waking_flags,
+				.prev_state = s.prev_state,
+				.next_state = s.next_state,
+				.next_offcpu_dur_ns = s.next_offcpu_dur_ns,
+				.prev_oncpu_ctrs = s.prev_oncpu_ctrs,
+				.prev_oncpu_ts = s.prev_oncpu_ts,
+				.pmu_vals = s.pmu_vals,
+				.compound_delay_ns = s.next_st ? s.next_st->compound_delay_ns : 0,
+				.compound_chain_len = s.next_st ? s.next_st->compound_chain_len : 0,
+			};
+
+			if (js.pool && !js.no_worker_emitters)
+				memcpy(json_emit_reserve(&js, json_render_event, e, sizeof(snapshot)), &snapshot, sizeof(snapshot));
+			else
+				emit_switch_json(w, e, &snapshot);
+		}
 	} else {
 		emit_switch(w, e, &s);
 	}
@@ -2758,10 +2794,14 @@ emit:
 
 	if (!trace_waker)
 		return 0;
-	if (env.json_path)
-		emit_waking_json(w, e, flags);
-	else
+	if (env.json_path) {
+		if (js.pool && !js.no_worker_emitters)
+			json_emit_reserve(&js, json_render_event, e, 0);
+		else
+			emit_waking_json(w, e, flags);
+	} else {
 		emit_waking(w, e, flags);
+	}
 	return 0;
 }
 
@@ -2826,10 +2866,14 @@ static int process_hardirq_exit(struct worker_state *w, const struct wevent *e)
 	if (!should_trace_task(&task))
 		return 0;
 
-	if (env.json_path)
-		emit_hardirq_exit_json(w, e);
-	else
+	if (env.json_path) {
+		if (js.pool && !js.no_worker_emitters)
+			json_emit_reserve(&js, json_render_event, e, 0);
+		else
+			emit_hardirq_exit_json(w, e);
+	} else {
 		emit_hardirq_exit(w, e);
+	}
 	return 0;
 }
 
@@ -2902,10 +2946,14 @@ static int process_softirq_exit(struct worker_state *w, const struct wevent *e)
 	if (!should_trace_task(&task))
 		return 0;
 
-	if (env.json_path)
-		emit_softirq_exit_json(w, e);
-	else
+	if (env.json_path) {
+		if (js.pool && !js.no_worker_emitters)
+			json_emit_reserve(&js, json_render_event, e, 0);
+		else
+			emit_softirq_exit_json(w, e);
+	} else {
 		emit_softirq_exit(w, e);
+	}
 	return 0;
 }
 
@@ -3544,6 +3592,22 @@ static const char *req_event_str(enum wprof_req_event_kind kind)
 	}
 }
 
+struct json_req_snapshot {
+	u64 oncpu_ns, offcpu_ns;
+	bool has_ctrs;
+};
+
+static void json_queue_req(const struct wevent *e, const struct pmu_val *req_ctrs, u64 oncpu_ns, u64 offcpu_ns)
+{
+	struct json_req_snapshot s = { .oncpu_ns = oncpu_ns, .offcpu_ns = offcpu_ns, .has_ctrs = req_ctrs != NULL };
+	size_t ctrs_len = req_ctrs ? env.pmu_real_cnt * sizeof(*req_ctrs) : 0;
+	char *snapshot = json_emit_reserve(&js, json_render_event, e, sizeof(s) + ctrs_len);
+
+	memcpy(snapshot, &s, sizeof(s));
+	if (req_ctrs)
+		memcpy(snapshot + sizeof(s), req_ctrs, ctrs_len);
+}
+
 static void emit_req_event_json(struct worker_state *w, const struct wevent *e,
 				const struct pmu_val *req_ctrs, u64 req_oncpu_ns, u64 req_offcpu_ns)
 {
@@ -3629,10 +3693,14 @@ static int process_req_event(struct worker_state *w, const struct wevent *e)
 		BUG("unhandled req event %d\n", e->req.req_event);
 	}
 
-	if (env.json_path)
-		emit_req_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
-	else
+	if (env.json_path) {
+		if (js.pool && !js.no_worker_emitters)
+			json_queue_req(e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+		else
+			emit_req_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+	} else {
 		emit_req_event(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+	}
 
 	return 0;
 }
@@ -4001,11 +4069,65 @@ static int process_req_task_event(struct worker_state *w, const struct wevent *e
 		}
 	}
 
-	if (env.json_path)
-		emit_req_task_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
-	else
+	if (env.json_path) {
+		if (js.pool && !js.no_worker_emitters)
+			json_queue_req(e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+		else
+			emit_req_task_event_json(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+	} else {
 		emit_req_task_event(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
+	}
 	return 0;
+}
+
+static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out)
+{
+	struct worker_state *w = ctx;
+	const struct wevent *e = event;
+
+	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
+	switch (e->kind) {
+	case EV_SWITCH: {
+		struct json_switch_snapshot s;
+
+		memcpy(&s, snapshot, sizeof(s));
+		emit_switch_json(w, e, &s);
+		break;
+	}
+	case EV_WAKING:
+	case EV_WAKEUP_NEW:
+		emit_waking_json(w, e, e->kind == EV_WAKEUP_NEW ? WF_WOKEN_NEW : WF_WOKEN);
+		break;
+	case EV_HARDIRQ_EXIT:
+		emit_hardirq_exit_json(w, e);
+		break;
+	case EV_SOFTIRQ_EXIT:
+		emit_softirq_exit_json(w, e);
+		break;
+	case EV_REQ_EVENT:
+	case EV_REQ_TASK_EVENT: {
+		struct json_req_snapshot s;
+		struct pmu_val ctrs[MAX_REAL_PMU_COUNTERS];
+		const struct pmu_val *req_ctrs = NULL;
+
+		memcpy(&s, snapshot, sizeof(s));
+		if (s.has_ctrs) {
+			/* Request accounting leaves unselected stored-counter slots zero. */
+			memset(ctrs + env.pmu_real_cnt, 0, (MAX_REAL_PMU_COUNTERS - env.pmu_real_cnt) * sizeof(*ctrs));
+			memcpy(ctrs, (const char *)snapshot + sizeof(s), env.pmu_real_cnt * sizeof(*ctrs));
+			req_ctrs = ctrs;
+		}
+		if (e->kind == EV_REQ_EVENT)
+			emit_req_event_json(w, e, req_ctrs, s.oncpu_ns, s.offcpu_ns);
+		else
+			emit_req_task_event_json(w, e, req_ctrs, s.oncpu_ns, s.offcpu_ns);
+		break;
+	}
+	default:
+		BUG("unhandled deferred JSON event %d\n", e->kind);
+	}
+	*out = js.out;
+	sfmt_reset();
 }
 
 /*
@@ -5856,6 +5978,8 @@ int emit_trace(struct worker_state *w)
 		};
 		js.no_parallel = env.json_no_parallel;
 		js.no_reuse = env.json_no_reuse;
+		js.no_worker_emitters = env.json_no_worker_emitters;
+		js.emit_ctx = w;
 		json_init(&js);
 		emit_header_json(w);
 		if (env.requested_stack_traces)

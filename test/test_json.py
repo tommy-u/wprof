@@ -25,7 +25,7 @@ JSON_DEBUG_FEATURES = (
 
 
 JSON_OPTIMIZATIONS = (
-    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens', 'literal-lengths', 'task-tokens', 'reuse',
+    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens', 'literal-lengths', 'task-tokens', 'reuse', 'worker-emitters',
 )
 
 

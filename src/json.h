@@ -143,6 +143,7 @@ enum json_token {
 	JSON_TOKEN_FALSE = 0x8c,
 	JSON_TOKEN_KEY_ONLY = 0x8d,
 	JSON_TOKEN_TASK = 0x8e,
+	JSON_TOKEN_EMIT = 0x8f,
 };
 
 struct json_task_data {
@@ -169,12 +170,21 @@ struct json_buf {
 	struct json_options options;
 };
 
+typedef void (*json_emit_fn)(void *ctx, const void *event, const void *snapshot, struct json_buf *out);
+
+struct json_emit_record {
+	json_emit_fn emit;
+	const void *event;
+	size_t snapshot_len;
+};
+
 struct json_job {
 	struct json_job *next;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
 	struct json_options options;
+	void *emit_ctx;
 	struct json_buf out;
 };
 
@@ -182,8 +192,10 @@ struct json_state {
 	struct json_buf out;
 	struct wpool *pool;
 	struct json_job *free_jobs;
+	void *emit_ctx;
 	bool no_parallel;
 	bool no_reuse;
+	bool no_worker_emitters;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -448,7 +460,8 @@ static inline const char *json_putkey(struct json_buf *b, const char *key, bool 
 }
 
 /* Payloads are native-endian and unaligned; copied strings include their NUL terminator. */
-static inline void json_render(const char *data, size_t len, struct json_options options, struct json_buf *out)
+static inline void json_render(const char *data, size_t len, struct json_options options, struct json_buf *out,
+			       void *emit_ctx)
 {
 	const unsigned char *p = (const unsigned char *)data;
 	const unsigned char *end = p + len;
@@ -526,6 +539,15 @@ static inline void json_render(const char *data, size_t len, struct json_options
 			json_putc(out, '}');
 			break;
 		}
+		case JSON_TOKEN_EMIT: {
+			struct json_emit_record record;
+
+			memcpy(&record, p, sizeof(record));
+			p += sizeof(record);
+			record.emit(emit_ctx, record.event, p, out);
+			p += record.snapshot_len;
+			break;
+		}
 		case JSON_TOKEN_STRING:
 			p = (const unsigned char *)json_puts(out, (const char *)p) + 1;
 			break;
@@ -558,7 +580,7 @@ static inline void json_work(void *ctx, void *ptr)
 	struct json_job *job = ptr;
 
 	(void)ctx;
-	json_render(job->batch, job->batch_len, job->options, &job->out);
+	json_render(job->batch, job->batch_len, job->options, &job->out, job->emit_ctx);
 }
 
 static inline void json_job_release(struct json_state *js, struct json_job *job)
@@ -597,6 +619,7 @@ static inline void json_submit(struct json_state *js)
 	job->batch_len = js->batch_len;
 	job->batch_capacity = js->batch_capacity;
 	job->options = js->out.options;
+	job->emit_ctx = js->emit_ctx;
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
@@ -634,6 +657,17 @@ static inline void json_token_data(struct json_state *js, enum json_token token,
 
 	*p++ = token;
 	memcpy(p, data, n);
+}
+
+/* Event and context pointers remain valid through finish; snapshots are copied into the batch. */
+static inline char *json_emit_reserve(struct json_state *js, json_emit_fn emit, const void *event, size_t snapshot_len)
+{
+	struct json_emit_record record = { .emit = emit, .event = event, .snapshot_len = snapshot_len };
+	char *p = json_token_reserve(js, 1 + sizeof(record) + snapshot_len);
+
+	*p++ = JSON_TOKEN_EMIT;
+	memcpy(p, &record, sizeof(record));
+	return p + sizeof(record);
 }
 
 static inline void json_token_string(struct json_state *js, enum json_token token, const char *s)
