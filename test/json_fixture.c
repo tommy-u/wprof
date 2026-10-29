@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2026 Meta Platforms, Inc. */
+#define _GNU_SOURCE
+#include <errno.h>
 #include <float.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,15 +24,35 @@ typedef uint32_t u32;
 
 int main(int argc, char **argv)
 {
-	const char *features[] = { "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel", "json-no-writer" };
-	const char *optimizations[] = { "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths", "task-tokens", "reuse", "worker-emitters", "writer" };
+	const char *features[] = {
+		"json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel", "json-no-writer",
+	};
+	const char *optimizations[] = {
+		"buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths",
+		"task-tokens", "reuse", "worker-emitters", "writer",
+	};
 	const size_t debug_optimization[] = { 0, 1, 2, 3, 9 };
 	bool disabled[10] = { false };
 	bool empty = false;
+	size_t workers = 0, batch_size = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--empty") == 0) {
 			empty = true;
+		} else if ((strcmp(argv[i], "--json-workers") == 0 || strcmp(argv[i], "--json-batch-size") == 0) && i + 1 < argc) {
+			bool worker_option = strcmp(argv[i], "--json-workers") == 0;
+			const char *arg = argv[++i];
+			char *end;
+			unsigned long long value;
+
+			errno = 0;
+			value = strtoull(arg, &end, 10);
+			if (arg[0] < '0' || arg[0] > '9' || errno || *end || !value || value > (worker_option ? UINT_MAX : 1ULL << 30))
+				return 2;
+			if (worker_option)
+				workers = value;
+			else
+				batch_size = value;
 		} else if ((strcmp(argv[i], "--json-opt") == 0 || strcmp(argv[i], "--no-json-opt") == 0) && i + 1 < argc) {
 			bool disable = strcmp(argv[i], "--no-json-opt") == 0;
 			const char *name = argv[++i];
@@ -72,9 +95,15 @@ int main(int argc, char **argv)
 	js.no_reuse = disabled[7];
 	js.no_worker_emitters = disabled[8];
 	js.no_writer = disabled[9];
+	if (workers)
+		js.max_workers = workers;
+	if (batch_size)
+		js.batch_size = batch_size;
 	json_init(&js);
 #else
 	(void)disabled;
+	(void)workers;
+	(void)batch_size;
 #endif
 
 	if (!empty) {

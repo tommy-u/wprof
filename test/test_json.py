@@ -20,24 +20,32 @@ WPROF = Path(os.environ.get("WPROF_BINARY", ROOT / "src/wprof"))
 REFERENCE_BYTES = 7219740
 REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
-JSON_DEBUG_FEATURES = (
-    'json-no-batching', 'json-no-int-format', 'json-no-int-ts', 'json-no-parallel', 'json-no-writer',
-)
-
-
 JSON_OPTIMIZATIONS = (
-    'buffering', 'integers', 'timestamps', 'parallel', 'key-tokens', 'literal-lengths', 'task-tokens', 'reuse', 'worker-emitters', 'writer',
+    "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths",
+    "task-tokens", "reuse", "worker-emitters", "writer",
+)
+JSON_DEBUG_FEATURES = (
+    "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel", "json-no-writer",
 )
 
 
 class JsonOptionsTest(unittest.TestCase):
-    def test_unknown_json_optimization_is_rejected(self):
-        for flag in ("--json-opt", "--no-json-opt"):
-            with self.subTest(flag=flag):
-                result = subprocess.run([str(WPROF), flag, "unknown"], capture_output=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(b"Unknown JSON optimization 'unknown'", result.stderr)
-                self.assertIn(flag.encode(), result.stderr)
+    def test_removed_mode_flag_is_rejected(self):
+        result = subprocess.run(
+            [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--fast-json"],
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"unrecognized option", result.stderr)
+        self.assertIn(b"--fast-json", result.stderr)
+
+    def test_help_describes_json_tuning_and_debug_features(self):
+        result = subprocess.run([str(WPROF), "--help"], capture_output=True, check=True)
+        self.assertNotIn(b"--fast-json", result.stdout)
+        for flag in (b"--json-workers", b"--json-batch-size", b"--json-opt", b"--no-json-opt"):
+            self.assertIn(flag, result.stdout)
+        for feature in JSON_DEBUG_FEATURES:
+            self.assertIn(feature.encode(), result.stdout)
 
     def test_json_optimization_controls_are_accepted(self):
         for flag in ("--json-opt", "--no-json-opt"):
@@ -51,23 +59,60 @@ class JsonOptionsTest(unittest.TestCase):
                     self.assertNotIn(b"Unknown JSON optimization", result.stderr)
                     self.assertIn(b"/missing-json-test.data", result.stderr)
 
-    def test_removed_mode_and_tuning_flags_are_rejected(self):
-        for flags in (("--fast-json",), ("--json-workers", "4"), ("--json-batch-size", "1mb")):
-            with self.subTest(flags=flags):
+    def test_unknown_json_optimization_is_rejected(self):
+        for flag in ("--json-opt", "--no-json-opt"):
+            with self.subTest(flag=flag):
+                result = subprocess.run([str(WPROF), flag, "unknown"], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Unknown JSON optimization 'unknown'", result.stderr)
+                self.assertIn(flag.encode(), result.stderr)
+
+    def test_json_tuning_values_are_accepted_before_opening_data(self):
+        for flag, values in (
+            ("--json-workers", ("1", "2", "16", "32", "0002", "4294967295")),
+            ("--json-batch-size", ("1", "7", "64", "4096", "1b", "1kb", "1mb", "4mb", "0.5kb", "1gb", "1073741824")),
+        ):
+            for value in values:
+                with self.subTest(flag=flag, value=value):
+                    result = subprocess.run(
+                        [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", flag, value],
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(b"unrecognized option", result.stderr)
+                    self.assertNotIn(b"Invalid --json", result.stderr)
+                    self.assertIn(b"/missing-json-test.data", result.stderr)
+
+    def test_invalid_json_tuning_values_report_the_flag_and_range(self):
+        for flag, values, range_text in (
+            ("--json-workers", (
+                "", "0", "-1", "+1", " 1", "1 ", "1x", "1.5", "0x10", "4294967296", "18446744073709551616",
+            ), b"1.."),
+            ("--json-batch-size", (
+                "", "0", "0b", "0.5", "-1", "1m", "junk", "nan", "inf", "1073741825", "2gb",
+                "18446744073709551616b", "18446744073709551616e-12b", "1e999mb",
+            ), b"1 GiB"),
+        ):
+            for value in values:
+                with self.subTest(flag=flag, value=value):
+                    result = subprocess.run(
+                        [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", f"{flag}={value}"],
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(flag.encode(), result.stderr)
+                    self.assertIn(range_text, result.stderr)
+
+    def test_json_tuning_flags_require_values(self):
+        for flag in ("--json-workers", "--json-batch-size"):
+            with self.subTest(flag=flag):
                 result = subprocess.run(
-                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", *flags],
+                    [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", flag],
                     capture_output=True,
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(b"unrecognized option", result.stderr)
-                self.assertIn(flags[0].encode(), result.stderr)
-
-    def test_help_omits_removed_json_flags(self):
-        result = subprocess.run([str(WPROF), "--help"], capture_output=True, check=True)
-        for flag in (b"--fast-json", b"--json-workers", b"--json-batch-size"):
-            self.assertNotIn(flag, result.stdout)
-        for feature in JSON_DEBUG_FEATURES:
-            self.assertIn(feature.encode(), result.stdout)
+                self.assertIn(flag.encode(), result.stderr)
+                self.assertIn(b"requires an argument", result.stderr)
 
     def test_json_debug_features_are_accepted(self):
         for feature in JSON_DEBUG_FEATURES:
@@ -82,23 +127,6 @@ class JsonOptionsTest(unittest.TestCase):
 
 
 class JsonWriterTest(unittest.TestCase):
-    def test_named_optimization_controls_match_reference_bytes(self):
-        settings = [["--no-json-opt", name] for name in JSON_OPTIMIZATIONS]
-        settings.extend((
-            ["--no-json-opt", "all"],
-            ["--no-json-opt", "all", "--json-opt", "all"],
-            ["--json-opt", "all", "--no-json-opt", "all"],
-            ["--debug", "json-no-parallel", "--json-opt", "parallel"],
-            ["--json-opt", "parallel", "--debug", "json-no-parallel"],
-        ))
-        for flags in settings:
-            with self.subTest(flags=flags):
-                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
-                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
-                self.assertEqual(reference, self.reference)
-                self.assertEqual(output, reference)
-                self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
-
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="wprof-json-reference-test-")
@@ -151,20 +179,47 @@ class JsonWriterTest(unittest.TestCase):
 
     def test_debug_combinations_match_reference_bytes(self):
         checked = 0
-        for mask in range(1 << len(JSON_DEBUG_FEATURES)):
+        for mask in range(32):
             features = [feature for bit, feature in enumerate(JSON_DEBUG_FEATURES) if mask & (1 << bit)]
-            if "json-no-parallel" in JSON_DEBUG_FEATURES and "json-no-batching" in features and "json-no-parallel" not in features:
+            if "json-no-batching" in features and "json-no-parallel" not in features:
                 continue
             flags = [arg for feature in features for arg in ("--debug", feature)]
             with self.subTest(features=features):
-                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags])
-                output = subprocess.check_output([str(self.fixtures["default"]), *flags])
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
                 self.assertEqual(reference, self.reference)
                 self.assertEqual(output, reference)
                 self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
                 checked += 1
-        self.assertGreater(checked, 0)
+        self.assertEqual(checked, 24)
         print(f"Verified {checked} debug combinations, SHA-256 {REFERENCE_SHA256}")
+
+    def test_named_optimization_controls_match_reference_bytes(self):
+        settings = [["--no-json-opt", name] for name in JSON_OPTIMIZATIONS]
+        settings.extend((
+            ["--no-json-opt", "all"],
+            ["--no-json-opt", "all", "--json-opt", "all"],
+            ["--json-opt", "all", "--no-json-opt", "all"],
+            ["--debug", "json-no-parallel", "--json-opt", "parallel"],
+            ["--json-opt", "parallel", "--debug", "json-no-parallel"],
+        ))
+        for flags in settings:
+            with self.subTest(flags=flags):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, reference)
+                self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
+
+    def test_worker_and_batch_sizes_match_reference_bytes(self):
+        for workers, batch_size in ((1, 1), (2, 7), (16, 64), (32, 4096), (2, 1024 * 1024), (16, 4 * 1024 * 1024)):
+            flags = ["--json-workers", str(workers), "--json-batch-size", str(batch_size)]
+            with self.subTest(workers=workers, batch_size=batch_size):
+                reference = subprocess.check_output([str(self.fixtures["reference"]), *flags], timeout=30)
+                output = subprocess.check_output([str(self.fixtures["default"]), *flags], timeout=30)
+                self.assertEqual(reference, self.reference)
+                self.assertEqual(output, reference)
+                self.assertEqual(hashlib.sha256(output).hexdigest(), REFERENCE_SHA256)
 
     def test_control_bytes_utf8_and_owned_strings(self):
         first = self.records[0]

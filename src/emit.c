@@ -5980,6 +5980,10 @@ int emit_trace(struct worker_state *w)
 		js.no_writer = env.json_no_writer;
 		js.no_reuse = env.json_no_reuse;
 		js.no_worker_emitters = env.json_no_worker_emitters;
+		if (env.json_workers)
+			js.max_workers = env.json_workers;
+		if (env.json_batch_size)
+			js.batch_size = env.json_batch_size;
 		js.emit_ctx = w;
 		json_init(&js);
 		emit_header_json(w);

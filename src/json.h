@@ -213,6 +213,8 @@ struct json_state {
 	bool no_writer;
 	bool no_reuse;
 	bool no_worker_emitters;
+	size_t max_workers;
+	size_t batch_size;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -221,7 +223,7 @@ struct json_state {
 	int cnt[5]; /* comma tracking per level */
 };
 
-#define JSON_STATE_INIT(file) { .out = { .f = (file) }, .lvl = -1 }
+#define JSON_STATE_INIT(file) { .out = { .f = (file) }, .max_workers = 16, .batch_size = JSON_BUF_SZ, .lvl = -1 }
 
 #ifndef JSON_BUF_SZ
 #define JSON_BUF_SZ (1024 * 1024)
@@ -739,10 +741,10 @@ static inline void json_submit(struct json_state *js)
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
 {
-	if (n > js->batch_capacity - js->batch_len)
+	if (js->batch_len && (js->batch_len >= js->batch_size || n > js->batch_size - js->batch_len))
 		json_submit(js);
 	if (n > js->batch_capacity) {
-		size_t capacity = n > JSON_BUF_SZ ? n : JSON_BUF_SZ;
+		size_t capacity = n > js->batch_size ? n : js->batch_size;
 
 		js->batch = realloc(js->batch, capacity);
 		js->batch_capacity = capacity;
@@ -865,10 +867,10 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 static inline void json_init(struct json_state *js)
 {
 	if (!js->out.options.no_batching && !js->no_parallel)
-		js->pool = wpool_new(16, json_work, json_done, js);
+		js->pool = wpool_new(js->max_workers, json_work, json_done, js);
 	if (js->pool) {
-		js->batch = malloc(JSON_BUF_SZ);
-		js->batch_capacity = JSON_BUF_SZ;
+		js->batch = malloc(js->batch_size);
+		js->batch_capacity = js->batch_size;
 		if (!js->no_writer)
 			json_writer_start(js);
 	} else if (!js->out.options.no_batching) {

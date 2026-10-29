@@ -4,6 +4,8 @@
 #define _FILE_OFFSET_BITS 64
 #include <argp.h>
 #include <assert.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -113,6 +115,8 @@ enum {
 	OPT_JSON_SCHEMA = 1018,
 	OPT_PREPARE = 1019,
 	OPT_ACTIVATE = 1020,
+	OPT_JSON_WORKERS = 1021,
+	OPT_JSON_BATCH_SIZE = 1022,
 	OPT_JSON_OPT = 1024,
 	OPT_NO_JSON_OPT = 1025,
 
@@ -203,6 +207,8 @@ static const struct argp_option opts[] = {
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
 	  "task-tokens, reuse, worker-emitters, writer, all (last setting wins)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
+	{ "json-workers", OPT_JSON_WORKERS, "N", 0, "JSON serializer workers (default: 16, capped to available CPUs; 1 disables parallel serialization)" },
+	{ "json-batch-size", OPT_JSON_BATCH_SIZE, "SIZE", 0, "JSON batch size; accepts units b/kb/mb/gb, bare number is bytes (default: 1mb; range: 1b..1gb)" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 
 	{ "record", OPT_RECORD, NULL, 0, "Record mode (default, mutually exclusive with --replay)" },
@@ -519,6 +525,30 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return -EINVAL;
 		}
 		break;
+	case OPT_JSON_WORKERS: {
+		char *end;
+		unsigned long long workers;
+
+		errno = 0;
+		workers = strtoull(arg, &end, 10);
+		if (arg[0] < '0' || arg[0] > '9' || errno || *end || !workers || workers > UINT_MAX) {
+			eprintf("Invalid --json-workers '%s': expected a positive decimal integer in range 1..%u\n", arg, UINT_MAX);
+			return -EINVAL;
+		}
+		env.json_workers = workers;
+		break;
+	}
+	case OPT_JSON_BATCH_SIZE: {
+		u64 sz;
+
+		errno = 0;
+		if (parse_size(arg, SZ_B, &sz) || errno == ERANGE || !sz || sz > (1ULL << 30)) {
+			eprintf("Invalid --json-batch-size '%s': expected a size between 1 byte and 1 GiB\n", arg);
+			return -EINVAL;
+		}
+		env.json_batch_size = sz;
+		break;
+	}
 	case OPT_JSON_SCHEMA: {
 		extern const char json_schema_start[];
 		extern const char json_schema_end[];
