@@ -13,6 +13,21 @@ BLAZESYM_DEBUG ?=
 #
 STATIC ?=
 LTO ?= 1
+PGO ?= off
+PGO_DIR ?=
+
+ifeq ($(PGO),generate)
+PGO_FLAGS := -fprofile-generate=$(abspath $(PGO_DIR)) -fprofile-update=atomic
+else ifeq ($(PGO),use)
+PGO_FLAGS := -fprofile-use=$(abspath $(PGO_DIR)) -fprofile-correction -Werror=missing-profile
+else ifneq ($(PGO),off)
+$(error PGO must be off, generate, or use)
+endif
+ifneq ($(PGO),off)
+ifeq ($(strip $(PGO_DIR)),)
+$(error PGO_DIR is required for PGO=$(PGO))
+endif
+endif
 
 # for installation
 DESTDIR ?=
@@ -231,6 +246,16 @@ WPROF_HDRS := wprof.h utils.h env.h protobuf.h data.h emit.h json.h stacktrace.h
 	      wpb.h wrust.h injmgr.h wprof_query.h
 WPROF_OBJS := $(patsubst %.c,$(OUTPUT)/%.o,$(WPROF_SRCS))
 
+$(WPROF_OBJS): private ALL_CFLAGS += $(PGO_FLAGS)
+$(WPROF_OBJS): $(OUTPUT)/wprof_pgo_flags
+
+# Rebuild application objects when switching PGO mode or profile directory.
+.PHONY: force_pgo_flags
+$(OUTPUT)/wprof_pgo_flags: force_pgo_flags | $(OUTPUT)
+	$(Q)printf '%s\n' '$(PGO_FLAGS)' > $@.tmp
+	$(Q)cmp -s $@.tmp $@ 2>/dev/null || mv -f $@.tmp $@
+	$(Q)rm -f $@.tmp
+
 WPROFINJ_SRCS := inj_lib.c inj_strset.c inj_hashmap.c inj_cupti.c inj_pytrace.c inj_torch_profiler.c
 WPROFINJ_HDRS := inj_common.h inj.h wprof_cupti.h pytrace_data.h strcache.h
 WPROFINJ_OBJS := $(patsubst %.c,$(OUTPUT)/%.o,$(WPROFINJ_SRCS))
@@ -279,13 +304,13 @@ wprof: $(WPROF_HDRS) $(WPROF_OBJS)								\
 		$(OUTPUT)/json_schema_embed.o							\
 		$(LIBBPF_OBJ) $(LIBBLAZESYM_OBJ) $(LIBDEMANGLE_OBJ) $(LIBWPB_OBJ) $(LIBWRUST_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
-	$(Q)$(CC) $(ALL_CFLAGS) $(filter %.c %.a %.o,$^) $(ALL_LDFLAGS) $(if $(STATIC),--static) -lelf -lz -lzstd -o $@
+	$(Q)$(CC) $(ALL_CFLAGS) $(PGO_FLAGS) $(filter %.c %.a %.o,$^) $(ALL_LDFLAGS) $(if $(STATIC),--static) -lelf -lz -lzstd -o $@
 
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
 	$(Q)rm -rf $(OUTPUT)/*.o $(OUTPUT)/*.skel.h $(OUTPUT)/libwprofinj.* $(OUTPUT)/wprof_build_info.h wprof 		\
-		$(LIBWPB_OBJ) $(LIBWRUST_OBJ) $(LIBWPB_SRC)/target $(LIBWRUST_SRC)/target
+		$(OUTPUT)/wprof_pgo_flags $(LIBWPB_OBJ) $(LIBWRUST_OBJ) $(LIBWPB_SRC)/target $(LIBWRUST_SRC)/target
 
 .PHONY: clean-all
 clean-all: clean
