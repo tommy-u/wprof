@@ -1611,6 +1611,17 @@ static void json_task(struct json_state *j, enum json_key_id key, const struct w
 {
 	int tid = task_tid(t);
 
+	if (j->pool && !j->out.options.no_task_tokens) {
+		struct json_task_data task = { .tid = tid, .pid = t->pid, .comm = t->comm, .pcomm = t->pcomm };
+
+		if (j->out.options.no_key_tokens) {
+			json_key_id(j, key);
+			json_token_data(j, JSON_TOKEN_TASK, &task, sizeof(task));
+		} else {
+			json_field_data(j, key, JSON_TOKEN_TASK, &task, sizeof(task));
+		}
+		return;
+	}
 	json_subobj_start_id(j, key);
 	if (tid)
 		json_kv_int_id(j, JSON_KEY_TID, tid);
@@ -5841,6 +5852,7 @@ int emit_trace(struct worker_state *w)
 			.no_int_ts = env.json_no_int_ts,
 			.no_key_tokens = env.json_no_key_tokens,
 			.no_literal_lengths = env.json_no_literal_lengths,
+			.no_task_tokens = env.json_no_task_tokens,
 		};
 		js.no_parallel = env.json_no_parallel;
 		json_init(&js);

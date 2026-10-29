@@ -236,6 +236,7 @@ struct env {
 	bool json_no_parallel;
 	bool json_no_key_tokens;
 	bool json_no_literal_lengths;
+	bool json_no_task_tokens;
 	bool keep_workdir;
 	bool raw_stacks;
 	bool no_tsidx;		/* replay: ignore the timestamp index, force full walk */

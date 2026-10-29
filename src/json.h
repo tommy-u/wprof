@@ -123,7 +123,8 @@ static const struct json_known_key json_known_keys[] = {
 
 /* Batches contain ASCII syntax and complete typed tokens with native-endian
  * payloads. Strings are copied immediately, including their NUL terminator;
- * float format pointers refer to static literals. Combined fields contain a
+ * float format pointers refer to static literals. Task names borrow the input
+ * mapping, which stays alive through json_finish(). Combined fields contain a
  * key ID, a value kind, and its payload; FIELD_COMMA includes the leading comma.
  */
 enum json_token {
@@ -141,6 +142,14 @@ enum json_token {
 	JSON_TOKEN_TRUE = 0x8b,
 	JSON_TOKEN_FALSE = 0x8c,
 	JSON_TOKEN_KEY_ONLY = 0x8d,
+	JSON_TOKEN_TASK = 0x8e,
+};
+
+struct json_task_data {
+	int tid;
+	u32 pid;
+	const char *comm;
+	const char *pcomm;
 };
 
 struct json_options {
@@ -149,6 +158,7 @@ struct json_options {
 	bool no_int_ts;
 	bool no_key_tokens;
 	bool no_literal_lengths;
+	bool no_task_tokens;
 };
 
 struct json_buf {
@@ -485,6 +495,26 @@ static inline void json_render(const char *data, size_t len, struct json_options
 			memcpy(&ns, p, sizeof(ns));
 			p += sizeof(ns);
 			json_ts(out, ns);
+			break;
+		}
+		case JSON_TOKEN_TASK: {
+			struct json_task_data task;
+
+			memcpy(&task, p, sizeof(task));
+			p += sizeof(task);
+			json_putc(out, '{');
+			if (task.tid) {
+				json_write(out, "\"tid\":", 6);
+				json_int(out, task.tid);
+				json_putc(out, ',');
+			}
+			json_write(out, "\"pid\":", 6);
+			json_int(out, task.pid);
+			json_write(out, ",\"comm\":", 8);
+			json_putquoted(out, task.comm);
+			json_write(out, ",\"pcomm\":", 9);
+			json_putquoted(out, task.pcomm);
+			json_putc(out, '}');
 			break;
 		}
 		case JSON_TOKEN_STRING:
