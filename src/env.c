@@ -117,6 +117,7 @@ enum {
 	OPT_ACTIVATE = 1020,
 	OPT_JSON_WORKERS = 1021,
 	OPT_JSON_BATCH_SIZE = 1022,
+	OPT_JSON_DIRECT_IO = 1023,
 	OPT_JSON_OPT = 1024,
 	OPT_NO_JSON_OPT = 1025,
 
@@ -166,6 +167,8 @@ static const struct {
 	{ "reuse", &env.json_no_reuse, false },
 	{ "worker-emitters", &env.json_no_worker_emitters, false },
 	{ "writer", &env.json_no_writer, false },
+	{ "direct-io", &env.json_direct_io, true },
+	{ "nocow", &env.json_nocow, true },
 };
 
 static int set_json_optimization(const char *name, bool enabled)
@@ -205,10 +208,12 @@ static const struct argp_option opts[] = {
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
-	  "task-tokens, reuse, worker-emitters, writer, all (last setting wins)" },
+	  "task-tokens, reuse, worker-emitters, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-workers", OPT_JSON_WORKERS, "N", 0, "JSON serializer workers (default: 16, capped to available CPUs; 1 disables parallel serialization)" },
 	{ "json-batch-size", OPT_JSON_BATCH_SIZE, "SIZE", 0, "JSON batch size; accepts units b/kb/mb/gb, bare number is bytes (default: 1mb; range: 1b..1gb)" },
+	{ "json-direct-io", OPT_JSON_DIRECT_IO, NULL, 0,
+	  "Shorthand for --json-opt direct-io --json-opt nocow; disables output data checksums and compression on Btrfs" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
 
 	{ "record", OPT_RECORD, NULL, 0, "Record mode (default, mutually exclusive with --replay)" },
@@ -559,6 +564,10 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env.json_batch_size = sz;
 		break;
 	}
+	case OPT_JSON_DIRECT_IO:
+		env.json_direct_io = true;
+		env.json_nocow = true;
+		break;
 	case OPT_JSON_SCHEMA: {
 		extern const char json_schema_start[];
 		extern const char json_schema_end[];
