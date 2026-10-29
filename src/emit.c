@@ -5855,6 +5855,7 @@ int emit_trace(struct worker_state *w)
 			.no_task_tokens = env.json_no_task_tokens,
 		};
 		js.no_parallel = env.json_no_parallel;
+		js.no_reuse = env.json_no_reuse;
 		json_init(&js);
 		emit_header_json(w);
 		if (env.requested_stack_traces)

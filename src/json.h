@@ -170,8 +170,10 @@ struct json_buf {
 };
 
 struct json_job {
+	struct json_job *next;
 	char *batch;
 	size_t batch_len;
+	size_t batch_capacity;
 	struct json_options options;
 	struct json_buf out;
 };
@@ -179,7 +181,9 @@ struct json_job {
 struct json_state {
 	struct json_buf out;
 	struct wpool *pool;
+	struct json_job *free_jobs;
 	bool no_parallel;
+	bool no_reuse;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -449,7 +453,12 @@ static inline void json_render(const char *data, size_t len, struct json_options
 	const unsigned char *p = (const unsigned char *)data;
 	const unsigned char *end = p + len;
 
-	*out = (struct json_buf) { .data = malloc(JSON_BUF_SZ), .capacity = JSON_BUF_SZ, .options = options };
+	if (!out->data) {
+		out->data = malloc(JSON_BUF_SZ);
+		out->capacity = JSON_BUF_SZ;
+	}
+	out->len = 0;
+	out->options = options;
 	while (p < end) {
 		unsigned char token = *p++;
 
@@ -552,28 +561,55 @@ static inline void json_work(void *ctx, void *ptr)
 	json_render(job->batch, job->batch_len, job->options, &job->out);
 }
 
+static inline void json_job_release(struct json_state *js, struct json_job *job)
+{
+	if (js->no_reuse) {
+		free(job->batch);
+		free(job->out.data);
+		free(job);
+	} else {
+		job->next = js->free_jobs;
+		js->free_jobs = job;
+	}
+}
+
 static inline void json_done(void *ctx, void *ptr)
 {
+	struct json_state *js = ctx;
 	struct json_job *job = ptr;
-	FILE *f = ctx;
 
-	fwrite(job->out.data, 1, job->out.len, f);
-	free(job->batch);
-	free(job->out.data);
-	free(job);
+	fwrite(job->out.data, 1, job->out.len, js->out.f);
+	json_job_release(js, job);
 }
 
 static inline void json_submit(struct json_state *js)
 {
 	if (!js->batch_len)
 		return;
-	struct json_job *job = malloc(sizeof(*job));
+	struct json_job *job = js->free_jobs;
 
-	*job = (struct json_job) { .batch = js->batch, .batch_len = js->batch_len, .options = js->out.options };
+	if (job)
+		js->free_jobs = job->next;
+	else
+		job = calloc(1, sizeof(*job));
+	job->next = NULL;
+	job->batch = js->batch;
+	job->batch_len = js->batch_len;
+	job->batch_capacity = js->batch_capacity;
+	job->options = js->out.options;
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
 	wpool_submit(js->pool, job);
+	/* A full pool retires a written job during submit; reuse its batch for the producer. */
+	job = js->free_jobs;
+	if (!js->no_reuse && job) {
+		js->batch = job->batch;
+		js->batch_capacity = job->batch_capacity;
+		job->batch = NULL;
+		job->batch_len = 0;
+		job->batch_capacity = 0;
+	}
 }
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
@@ -693,7 +729,7 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 static inline void json_init(struct json_state *js)
 {
 	if (!js->out.options.no_batching && !js->no_parallel)
-		js->pool = wpool_new(4, json_work, json_done, js->out.f);
+		js->pool = wpool_new(4, json_work, json_done, js);
 	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
@@ -709,6 +745,14 @@ static inline void json_finish(struct json_state *js)
 		json_submit(js);
 		wpool_finish(js->pool);
 		free(js->batch);
+		while (js->free_jobs) {
+			struct json_job *job = js->free_jobs;
+
+			js->free_jobs = job->next;
+			free(job->batch);
+			free(job->out.data);
+			free(job);
+		}
 	} else {
 		json_flush(&js->out);
 		free(js->out.data);
