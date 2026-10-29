@@ -30,6 +30,7 @@ static int observed_join(pthread_t thread, void **result);
 static const char *records[] = {
 	RECORD(0), RECORD(1), RECORD(2), RECORD(3), RECORD(4), RECORD(5), RECORD(6), RECORD(7),
 	RECORD(8), RECORD(9), RECORD(10), RECORD(11), RECORD(12), RECORD(13), RECORD(14), RECORD(15), RECORD(16),
+	RECORD(17), RECORD(18), RECORD(19), RECORD(20), RECORD(21), RECORD(22), RECORD(23), RECORD(24),
 };
 #undef RECORD
 
@@ -51,9 +52,9 @@ struct fixture {
 	int writer_attempts;
 	int count;
 	int submitted;
-	int ids[17];
-	uintptr_t jobs[17];
-	uintptr_t buffers[17];
+	int ids[25];
+	uintptr_t jobs[25];
+	uintptr_t buffers[25];
 	uintptr_t blocked_buffer;
 	char output[512];
 	size_t len;
@@ -189,7 +190,7 @@ static int gated_run(struct fixture *f, bool backpressure)
 {
 	pthread_t producer;
 
-	f->count = backpressure ? 17 : 2;
+	f->count = backpressure ? 25 : 2;
 	f->gate_first = true;
 	f->writer_writes = true;
 	assert(!pthread_create(&producer, NULL, produce, f));
@@ -237,7 +238,7 @@ static int gated_run(struct fixture *f, bool backpressure)
 				seen |= f->jobs[i] == f->jobs[j];
 			distinct += !seen;
 		}
-		assert(distinct <= 8);
+		assert(distinct <= 20);
 		assert(distinct < f->count);
 	}
 	return 0;
@@ -246,7 +247,7 @@ static int gated_run(struct fixture *f, bool backpressure)
 static int simple_run(struct fixture *f, const char *mode)
 {
 	f->caller = pthread_self();
-	f->count = strcmp(mode, "empty") == 0 ? 0 : 17;
+	f->count = strcmp(mode, "empty") == 0 ? 0 : 25;
 	f->js.no_writer = strcmp(mode, "no-writer") == 0;
 	f->js.no_parallel = strcmp(mode, "serial") == 0;
 	f->js.out.options.no_batching = strcmp(mode, "unbatched") == 0;
@@ -284,7 +285,7 @@ int main(int argc, char **argv)
 	f.js = (struct json_state)JSON_STATE_INIT(out);
 	f.js.emit_ctx = &f;
 	active = &f;
-	for (int i = 0; i < 17; i++)
+	for (int i = 0; i < 25; i++)
 		f.ids[i] = i;
 	int err;
 
