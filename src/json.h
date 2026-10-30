@@ -1,3 +1,6 @@
+#include <pthread.h>
+#include <sys/prctl.h>
+
 #include "strs.h"
 #include "wrust.h"
 
@@ -31,10 +34,23 @@ enum json_token {
 	JSON_TOKEN_EMIT = 0x88,
 };
 
+struct json_writer_state {
+	bool started;
+	bool closing;
+	pthread_t thread;
+	pthread_mutex_t mutex;
+	pthread_cond_t work;
+	pthread_cond_t space;
+	struct json_job *queue[2];
+	size_t head;
+	size_t count;
+};
+
 struct json_state {
 	FILE *f;
 	struct sbuf out;
 	struct wpool *pool;
+	struct json_writer_state writer;
 	void *emit_ctx;
 	char *batch;
 	size_t batch_len;
@@ -425,15 +441,87 @@ static inline void json_work(void *ctx, void *ptr)
 	job->out = render.out;
 }
 
-static inline void json_done(void *ctx, void *ptr)
+static inline void json_write_job(struct json_state *js, struct json_job *job)
 {
-	struct json_job *job = ptr;
-	FILE *f = ctx;
-
-	fwrite(job->out.buf, 1, job->out.len, f);
+	fwrite(job->out.buf, 1, job->out.len, js->f);
 	free(job->batch);
 	sbuf_free(&job->out);
 	free(job);
+}
+
+static void *json_writer_main(void *ctx)
+{
+	struct json_state *js = ctx;
+	struct json_writer_state *writer = &js->writer;
+
+	prctl(PR_SET_NAME, "wprof_json_io", 0, 0, 0);
+	pthread_mutex_lock(&writer->mutex);
+	for (;;) {
+		while (!writer->count && !writer->closing)
+			pthread_cond_wait(&writer->work, &writer->mutex);
+		if (!writer->count)
+			break;
+		struct json_job *job = writer->queue[writer->head];
+
+		writer->queue[writer->head] = NULL;
+		writer->head = (writer->head + 1) % 2;
+		writer->count--;
+		pthread_cond_signal(&writer->space);
+		pthread_mutex_unlock(&writer->mutex);
+		/* Keep draining after a failed write so producers cannot stay blocked. */
+		json_write_job(js, job);
+		pthread_mutex_lock(&writer->mutex);
+	}
+	pthread_mutex_unlock(&writer->mutex);
+	return NULL;
+}
+
+static inline void json_writer_start(struct json_state *js)
+{
+	struct json_writer_state *writer = &js->writer;
+	int err = pthread_mutex_init(&writer->mutex, NULL);
+
+	if (err)
+		goto fail;
+	err = pthread_cond_init(&writer->work, NULL);
+	if (err)
+		goto destroy_mutex;
+	err = pthread_cond_init(&writer->space, NULL);
+	if (err)
+		goto destroy_work;
+	err = pthread_create(&writer->thread, NULL, json_writer_main, js);
+	if (err)
+		goto destroy_space;
+	writer->started = true;
+	return;
+
+destroy_space:
+	pthread_cond_destroy(&writer->space);
+destroy_work:
+	pthread_cond_destroy(&writer->work);
+destroy_mutex:
+	pthread_mutex_destroy(&writer->mutex);
+fail:
+	fprintf(stderr, "Failed to start JSON writer: %s; using synchronous writes\n", strerror(err));
+}
+
+static inline void json_done(void *ctx, void *ptr)
+{
+	struct json_state *js = ctx;
+	struct json_job *job = ptr;
+	struct json_writer_state *writer = &js->writer;
+
+	if (writer->started) {
+		pthread_mutex_lock(&writer->mutex);
+		while (writer->count == 2)
+			pthread_cond_wait(&writer->space, &writer->mutex);
+		writer->queue[(writer->head + writer->count) % 2] = job;
+		writer->count++;
+		pthread_cond_signal(&writer->work);
+		pthread_mutex_unlock(&writer->mutex);
+		return;
+	}
+	json_write_job(js, job);
 }
 
 static inline void json_submit(struct json_state *js)
@@ -573,18 +661,32 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 
 static inline void json_init(struct json_state *js)
 {
-	js->pool = wpool_new(16, json_work, json_done, js->f);
+	js->pool = wpool_new(16, json_work, json_done, js);
 	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
+		json_writer_start(js);
 	}
 }
 
 static inline void json_finish(struct json_state *js)
 {
 	if (js->pool) {
+		struct json_writer_state *writer = &js->writer;
+
 		json_submit(js);
 		wpool_finish(js->pool);
+		if (writer->started) {
+			pthread_mutex_lock(&writer->mutex);
+			writer->closing = true;
+			pthread_cond_signal(&writer->work);
+			pthread_mutex_unlock(&writer->mutex);
+			pthread_join(writer->thread, NULL);
+			pthread_cond_destroy(&writer->space);
+			pthread_cond_destroy(&writer->work);
+			pthread_mutex_destroy(&writer->mutex);
+			writer->started = false;
+		}
 		free(js->batch);
 	} else if (js->out.len) {
 		json_flush(js);
