@@ -5973,83 +5973,146 @@ static void emit_header_json(struct worker_state *w)
 	json_obj_end(j);
 }
 
-struct json_frame {
+struct json_frame_fragment {
 	struct sbuf name;
 	struct sbuf src;
 	bool has_src;
 };
 
-static struct json_frame render_frame_json(struct wprof_data_hdr *hdr, u32 id)
-{
-	const struct wstack_frame *f = wstack_frame(hdr, id);
-	char frame_buf[1024];
-	const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
-	const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
-	struct json_frame frame = { .has_src = src && src[0] };
-	struct json_state fragment;
+struct json_stack_cache {
+	struct json_frame_fragment *frames;
+	size_t frame_cnt;
+};
 
-	json_frag_start(&fragment);
-	json_str(&fragment, name);
-	frame.name = json_frag_end(&fragment);
-	if (frame.has_src && f->line_num > 0) {
-		json_frag_start(&fragment);
-		json_fmt(&fragment, "%s:%u", src, f->line_num);
-		frame.src = json_frag_end(&fragment);
-	}
-	return frame;
-}
+struct json_stack_snapshot {
+	struct wstack_trace_record trace;
+	const struct json_frame_fragment *frames;
+};
 
-static void emit_stacks_json(struct worker_state *w)
+static void init_json_stack_cache(struct worker_state *w, struct json_stack_cache *cache)
 {
-	struct json_state *j = &js;
 	struct wprof_data_hdr *hdr = w->dump_hdr;
 	struct wstack_hdr *shdr = wstack_hdr(hdr);
+	char frame_buf[1024];
 
 	if (!shdr)
 		return;
-	size_t frame_cnt = shdr->frame_cnt;
-	struct json_frame *cache = calloc(frame_cnt, sizeof(*cache));
+	cache->frame_cnt = shdr->frame_cnt;
+	cache->frames = calloc(cache->frame_cnt, sizeof(*cache->frames));
 
+	/* Fill fragments before stack jobs can read them. */
 	struct wstack_trace_record *trec;
 	wstack_for_each_trace(trec, hdr, 0) {
-		json_obj_start(j);
-		json_kv_int_id(j, JSON_KEY_ID, trec->idx);
-
-		json_subarr_start_id(j, JSON_KEY_FRAMES);
-		bool has_src = false;
 		for (int i = 0; i < trec->frame_cnt; i++) {
 			u32 id = trec->frame_ids[i];
-			if (!cache[id].name.len)
-				cache[id] = render_frame_json(hdr, id);
-			json_arr_raw(j, &cache[id].name);
-			has_src |= cache[id].has_src;
+			struct json_frame_fragment *frame = &cache->frames[id];
+
+			if (frame->name.buf)
+				continue;
+			const struct wstack_frame *f = wstack_frame(hdr, id);
+			const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
+			const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+			struct json_state encoded = { .lvl = 0 };
+
+			json_arr_str(&encoded, name);
+			frame->name = encoded.out.buffer;
+			frame->has_src = src && src[0];
+			if (frame->has_src && f->line_num > 0) {
+				encoded = (struct json_state){ .lvl = 0 };
+				json_arr_fmt(&encoded, "%s:%u", src, f->line_num);
+				frame->src = encoded.out.buffer;
+			}
+		}
+	}
+}
+
+static void free_json_stack_cache(struct json_stack_cache *cache)
+{
+	for (size_t i = 0; i < cache->frame_cnt; i++) {
+		sbuf_free(&cache->frames[i].name);
+		sbuf_free(&cache->frames[i].src);
+	}
+	free(cache->frames);
+}
+
+static void emit_stack_json(const struct wstack_trace_record *trec, const struct json_frame_fragment *cache)
+{
+	struct json_state *j = &js;
+
+	json_obj_start(j);
+	json_kv_int_id(j, JSON_KEY_ID, trec->idx);
+
+	json_subarr_start_id(j, JSON_KEY_FRAMES);
+	bool has_src = false;
+	for (int i = 0; i < trec->frame_cnt; i++) {
+		u32 id = trec->frame_ids[i];
+
+		json_arr_elem(j);
+		json_fragment(j, cache[id].name.buf, cache[id].name.len);
+		has_src |= cache[id].has_src;
+	}
+	json_arr_end(j);
+
+	if (has_src) {
+		json_subarr_start_id(j, JSON_KEY_SRCS);
+		for (int i = 0; i < trec->frame_cnt; i++) {
+			u32 id = trec->frame_ids[i];
+
+			if (cache[id].src.buf) {
+				json_arr_elem(j);
+				json_fragment(j, cache[id].src.buf, cache[id].src.len);
+			} else {
+				json_arr_str(j, "");
+			}
 		}
 		json_arr_end(j);
+	}
 
-		if (has_src) {
-			json_subarr_start_id(j, JSON_KEY_SRCS);
-			for (int i = 0; i < trec->frame_cnt; i++) {
-				u32 id = trec->frame_ids[i];
-				if (cache[id].src.len)
-					json_arr_raw(j, &cache[id].src);
-				else {
-					json_arr_str(j, "");
-				}
-			}
-			json_arr_end(j);
+	json_obj_end(j);
+}
+
+static void json_render_stack(void *ctx __unused, const void *event __unused,
+			      const void *snapshot, struct json_buf *out)
+{
+	struct json_stack_snapshot stack;
+
+	memcpy(&stack, snapshot, sizeof(stack));
+	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
+	emit_stack_json(&stack.trace, stack.frames);
+	*out = js.out;
+	sfmt_reset();
+}
+
+static void emit_stacks_json(struct worker_state *w, struct json_stack_cache *cache)
+{
+	struct json_state *j = &js;
+	struct wprof_data_hdr *hdr = w->dump_hdr;
+	bool worker_stacks = j->pool && !env.json_no_worker_stacks;
+	struct wstack_trace_record *trec;
+
+	init_json_stack_cache(w, cache);
+	wstack_for_each_trace(trec, hdr, 0) {
+		if (!worker_stacks) {
+			emit_stack_json(trec, cache->frames);
+			continue;
 		}
+		size_t units = trec->frame_cnt ? trec->frame_cnt : 1;
+		struct json_stack_snapshot stack = { .trace = *trec, .frames = cache->frames };
 
-		json_obj_end(j);
+		if (units > 1024 || units > 1024 - j->stack_frame_units)
+			json_submit(j);
+		memcpy(json_emit_reserve(j, json_render_stack, NULL, sizeof(stack)), &stack, sizeof(stack));
+		j->stack_frame_units += units;
+		if (units > 1024)
+			json_submit(j);
 	}
-	for (size_t i = 0; i < frame_cnt; i++) {
-		sbuf_free(&cache[i].name);
-		sbuf_free(&cache[i].src);
-	}
-	free(cache);
+	if (worker_stacks)
+		json_submit(j);
 }
 
 int emit_trace(struct worker_state *w)
 {
+	struct json_stack_cache stack_cache = {};
 	int err;
 
 	wprintf("Generating trace...\n");
@@ -6090,7 +6153,7 @@ int emit_trace(struct worker_state *w)
 		}
 		emit_header_json(w);
 		if (env.requested_stack_traces)
-			emit_stacks_json(w);
+			emit_stacks_json(w, &stack_cache);
 	} else {
 		emit_pmu_intern_names(w);
 
@@ -6123,6 +6186,7 @@ int emit_trace(struct worker_state *w)
 	if (env.json_path) {
 		int write_err = json_finish(&js);
 
+		free_json_stack_cache(&stack_cache);
 		if (write_err) {
 			eprintf("Failed to write trace file '%s': %s\n", env.json_path, strerror(-write_err));
 			if (!err)

@@ -274,6 +274,7 @@ struct json_state {
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
+	size_t stack_frame_units;
 	int lvl;
 	enum json_scope scope[5];
 	int cnt[5]; /* comma tracking per level */
@@ -1120,6 +1121,7 @@ static inline void json_done(void *ctx, void *ptr)
 
 static inline void json_submit(struct json_state *js)
 {
+	js->stack_frame_units = 0;
 	if (!js->batch_len)
 		return;
 	struct json_job *job = calloc(1, sizeof(*job));

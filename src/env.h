@@ -241,6 +241,7 @@ struct env {
 	bool json_no_literal_lengths;
 	bool json_no_task_tokens;
 	bool json_no_worker_emitters;
+	bool json_no_worker_stacks;
 	bool json_no_worker_requests;
 	bool json_direct_io;
 	bool json_nocow;
