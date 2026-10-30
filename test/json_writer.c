@@ -267,6 +267,7 @@ int main(int argc, char **argv)
 	assert(out);
 	assert(!setvbuf(out, NULL, _IONBF, 0));
 	f.js = (struct json_state)JSON_STATE_INIT(out);
+	f.js.no_work_window = true;
 	f.js.emit_ctx = &f;
 	active = &f;
 	for (int i = 0; i < 25; i++)

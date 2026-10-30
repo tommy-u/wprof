@@ -265,6 +265,8 @@ struct json_state {
 	void *emit_ctx;
 	bool no_parallel;
 	bool no_writer;
+	bool no_work_window;
+	bool work_window;
 	bool no_worker_emitters;
 	bool worker_requests;
 	bool direct_io;
@@ -274,6 +276,7 @@ struct json_state {
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
+	size_t batch_output_estimate;
 	size_t stack_frame_units;
 	int lvl;
 	enum json_scope scope[5];
@@ -314,6 +317,9 @@ static inline struct sbuf json_frag_end(struct json_state *js)
 #define JSON_DIRECT_ALIGN 4096
 #define JSON_DIRECT_MEM_ALIGN (2 * 1024 * 1024)
 #define JSON_DIRECT_CHUNK_SZ (4 * 1024 * 1024)
+#define JSON_WINDOW_JOBS_PER_WORKER 4
+#define JSON_WINDOW_BYTES (256 * 1024 * 1024)
+#define JSON_EVENT_OUTPUT_ESTIMATE 256
 
 static inline void json_flush(struct json_state *js)
 {
@@ -1016,15 +1022,25 @@ static inline void json_write_job(void *ctx, void *ptr)
 	writer->float_integer_count += job->out.float_integer_count;
 	writer->float_fractional_count += job->out.float_fractional_count;
 	writer->float_fallback_count += job->out.float_fallback_count;
+	/* Retire failed output too, so a full submission window can always drain. */
 	if (!writer->error) {
 		writer->logical_size += job->out.buffer.len;
-		if (writer->direct_active) {
+		if (writer->direct_active)
 			json_direct_pack(writer, job->out.buffer.buf, job->out.buffer.len);
-		} else {
-			fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f);
-		}
+		else if (fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f) != (size_t)job->out.buffer.len)
+			writer->error = errno ? errno : EIO;
 	}
 	json_job_free(job);
+}
+
+static inline void json_writer_tail(struct json_writer_state *writer)
+{
+	if (writer->direct_active && !writer->error && writer->direct_len) {
+		size_t len = (writer->direct_len + JSON_DIRECT_ALIGN - 1) / JSON_DIRECT_ALIGN * JSON_DIRECT_ALIGN;
+
+		memset(writer->direct_data + writer->direct_len, 0, len - writer->direct_len);
+		json_direct_write(writer, len);
+	}
 }
 
 static void *json_writer_main(void *ctx)
@@ -1046,17 +1062,11 @@ static void *json_writer_main(void *ctx)
 		writer->count--;
 		pthread_cond_signal(&writer->space);
 		pthread_mutex_unlock(&writer->mutex);
-		/* Keep draining after a failed write so producers cannot stay blocked. */
 		json_write_job(js, job);
 		pthread_mutex_lock(&writer->mutex);
 	}
 	pthread_mutex_unlock(&writer->mutex);
-	if (writer->direct_active && !writer->error && writer->direct_len) {
-		size_t len = (writer->direct_len + JSON_DIRECT_ALIGN - 1) / JSON_DIRECT_ALIGN * JSON_DIRECT_ALIGN;
-
-		memset(writer->direct_data + writer->direct_len, 0, len - writer->direct_len);
-		json_direct_write(writer, len);
-	}
+	json_writer_tail(writer);
 	return NULL;
 }
 
@@ -1125,6 +1135,8 @@ static inline void json_submit(struct json_state *js)
 	if (!js->batch_len)
 		return;
 	struct json_job *job = calloc(1, sizeof(*job));
+	size_t output_estimate = js->batch_output_estimate > JSON_BUF_SZ ? js->batch_output_estimate : JSON_BUF_SZ;
+	size_t admission_bytes = js->batch_capacity + output_estimate + sizeof(*job);
 
 	job->batch = js->batch;
 	job->batch_len = js->batch_len;
@@ -1133,7 +1145,8 @@ static inline void json_submit(struct json_state *js)
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
-	wpool_submit(js->pool, job);
+	js->batch_output_estimate = 0;
+	wpool_submit_sized(js->pool, job, admission_bytes);
 }
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
@@ -1149,6 +1162,7 @@ static inline char *json_token_reserve(struct json_state *js, size_t n)
 	char *p = js->batch + js->batch_len;
 
 	js->batch_len += n;
+	js->batch_output_estimate += n;
 	return p;
 }
 
@@ -1161,7 +1175,10 @@ static inline void json_token_data(struct json_state *js, enum json_token token,
 	memcpy(p, data, n);
 }
 
-/* Cached fragments may contain UTF-8 bytes that overlap token IDs. */
+/* Event and context pointers remain valid through finish; snapshots are copied into the batch. */
+
+
+/* Rendered fragments may contain UTF-8 bytes that overlap token IDs. */
 static inline void json_fragment(struct json_state *js, const void *data, size_t n)
 {
 	if (js->pool) {
@@ -1289,12 +1306,28 @@ static inline void json_init(struct json_state *js)
 		js->writer.fd = fileno(js->out.f);
 	if (js->nocow)
 		json_nocow_prepare(js);
-	if (!js->out.options.no_batching && !js->no_parallel)
-		js->pool = wpool_new(js->max_workers, json_work, json_done, js);
+	if (!js->out.options.no_batching && !js->no_parallel) {
+		if (!js->no_writer && !js->no_work_window) {
+			js->pool = wpool_new_windowed(js->max_workers, JSON_WINDOW_JOBS_PER_WORKER, JSON_WINDOW_BYTES,
+						    json_work, json_write_job, js);
+			js->work_window = js->pool != NULL;
+		} else {
+			js->pool = wpool_new(js->max_workers, json_work, json_done, js);
+		}
+	}
 	if (js->pool) {
 		js->batch = malloc(js->batch_size);
 		js->batch_capacity = js->batch_size;
-		if (!js->no_writer)
+		if (js->work_window) {
+			js->writer.fd = fileno(js->out.f);
+			fprintf(stderr, "JSON work window: jobs_per_worker=%d admission_bytes=%d\n",
+				JSON_WINDOW_JOBS_PER_WORKER, JSON_WINDOW_BYTES);
+			if (js->direct_io)
+				json_direct_start(js);
+			if (js->writer.direct_active)
+				fprintf(stderr, "JSON direct I/O: enabled alignment=%d chunk=%d nocow=%d\n",
+					JSON_DIRECT_ALIGN, JSON_DIRECT_CHUNK_SZ, js->writer.nocow_active);
+		} else if (!js->no_writer)
 			json_writer_start(js);
 		else if (js->direct_io)
 			json_direct_fallback("dedicated JSON writer is disabled");
@@ -1320,23 +1353,25 @@ static inline int json_finish(struct json_state *js)
 			pthread_cond_signal(&writer->work);
 			pthread_mutex_unlock(&writer->mutex);
 			pthread_join(writer->thread, NULL);
-			if (writer->direct_active) {
-				/* The aligned last write can extend EOF; expose only the actual JSON bytes. */
-				if (!writer->error) {
-					int ret;
+		} else if (js->work_window) {
+			json_writer_tail(writer);
+		}
+		if (writer->direct_active) {
+			/* The aligned last write can extend EOF; expose only the actual JSON bytes. */
+			if (!writer->error) {
+				int ret;
 
-					do {
-						ret = ftruncate(writer->fd, writer->logical_size);
-					} while (ret && errno == EINTR);
-					if (ret)
-						writer->error = errno;
-				}
-				json_direct_restore_fd(writer);
-				if (fseeko(js->out.f, writer->logical_size, SEEK_SET) && !writer->error)
+				do {
+					ret = ftruncate(writer->fd, writer->logical_size);
+				} while (ret && errno == EINTR);
+				if (ret)
 					writer->error = errno;
-				free(writer->direct_data);
-				writer->direct_data = NULL;
 			}
+			json_direct_restore_fd(writer);
+			if (fseeko(js->out.f, writer->logical_size, SEEK_SET) && !writer->error)
+				writer->error = errno;
+			free(writer->direct_data);
+			writer->direct_data = NULL;
 		}
 		free(js->batch);
 		if (writer->started) {
