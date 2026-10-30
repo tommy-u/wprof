@@ -5979,7 +5979,6 @@ int emit_trace(struct worker_state *w)
 		};
 		js.no_parallel = env.json_no_parallel;
 		js.no_writer = env.json_no_writer;
-		js.no_reuse = env.json_no_reuse;
 		js.no_worker_emitters = env.json_no_worker_emitters;
 		js.direct_io = env.json_direct_io;
 		js.nocow = env.json_nocow;

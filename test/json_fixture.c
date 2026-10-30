@@ -29,10 +29,10 @@ int main(int argc, char **argv)
 	};
 	const char *optimizations[] = {
 		"buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths",
-		"task-tokens", "reuse", "worker-emitters", "writer",
+		"task-tokens", "worker-emitters", "writer",
 	};
-	const size_t debug_optimization[] = { 0, 1, 2, 3, 9 };
-	bool disabled[10] = { false };
+	const size_t debug_optimization[] = { 0, 1, 2, 3, 8 };
+	bool disabled[9] = { false };
 	bool empty = false;
 	size_t workers = 0, batch_size = 0;
 
@@ -59,13 +59,13 @@ int main(int argc, char **argv)
 			size_t optimization = 0;
 
 			if (strcmp(name, "all") == 0) {
-				for (size_t j = 0; j < 10; j++)
+				for (size_t j = 0; j < 9; j++)
 					disabled[j] = disable;
 				continue;
 			}
-			while (optimization < 10 && strcmp(name, optimizations[optimization]) != 0)
+			while (optimization < 9 && strcmp(name, optimizations[optimization]) != 0)
 				optimization++;
-			if (optimization == 10)
+			if (optimization == 9)
 				return 2;
 			disabled[optimization] = disable;
 		} else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
@@ -92,9 +92,8 @@ int main(int argc, char **argv)
 		.no_task_tokens = disabled[6],
 	};
 	js.no_parallel = disabled[3];
-	js.no_reuse = disabled[7];
-	js.no_worker_emitters = disabled[8];
-	js.no_writer = disabled[9];
+	js.no_worker_emitters = disabled[7];
+	js.no_writer = disabled[8];
 	if (workers)
 		js.max_workers = workers;
 	if (batch_size)

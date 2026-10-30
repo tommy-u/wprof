@@ -22,7 +22,7 @@ REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
 JSON_OPTIMIZATIONS = (
     "buffering", "integers", "timestamps", "parallel", "key-tokens", "literal-lengths",
-    "task-tokens", "reuse", "worker-emitters", "writer",
+    "task-tokens", "worker-emitters", "writer",
 )
 JSON_DEBUG_FEATURES = (
     "json-no-batching", "json-no-int-format", "json-no-int-ts", "json-no-parallel", "json-no-writer",
@@ -61,13 +61,17 @@ class JsonOptionsTest(unittest.TestCase):
                     self.assertNotIn(b"Unknown JSON optimization", result.stderr)
                     self.assertIn(b"/missing-json-test.data", result.stderr)
 
-    def test_unknown_json_optimization_is_rejected(self):
+    def test_unknown_or_removed_json_optimization_is_rejected(self):
         for flag in ("--json-opt", "--no-json-opt"):
-            with self.subTest(flag=flag):
-                result = subprocess.run([str(WPROF), flag, "unknown"], capture_output=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(b"Unknown JSON optimization 'unknown'", result.stderr)
-                self.assertIn(flag.encode(), result.stderr)
+            for name in ("unknown", "reuse"):
+                with self.subTest(flag=flag, name=name):
+                    result = subprocess.run(
+                        [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", flag, name],
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"Unknown JSON optimization '{name}'".encode(), result.stderr)
+                    self.assertIn(flag.encode(), result.stderr)
 
     def test_json_tuning_values_are_accepted_before_opening_data(self):
         for flag, values in (
