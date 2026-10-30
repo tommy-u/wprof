@@ -69,7 +69,20 @@ typedef void (*wpool_done_fn)(void *ctx, void *job);
  * job. Keep ctx valid through finish. Callbacks must not reenter this pool.
  */
 struct wpool *wpool_new(size_t max_workers, wpool_work_fn work, wpool_done_fn done, void *ctx);
+/* Uses the same CPU selection, with a shared FIFO input queue. jobs_per_worker
+ * must be nonzero. At most selected_workers * jobs_per_worker jobs are admitted,
+ * including queued, running, completed, and currently executing done callbacks.
+ * admission_bytes is a soft estimate: one oversize job is allowed when empty.
+ * Workers never wait for an output allocation budget. done runs directly on one
+ * dedicated wprof_json_io thread in submission order, then returns admission
+ * credits. Shared ctx access from work/done must be thread-safe; keep ctx valid
+ * through finish. One caller submits/finishes; callbacks must not reenter.
+ */
+struct wpool *wpool_new_windowed(size_t max_workers, size_t jobs_per_worker, size_t byte_limit,
+			       wpool_work_fn work, wpool_done_fn done, void *ctx);
+/* submit uses zero admission bytes; sized admission is ignored by legacy pools. */
 void wpool_submit(struct wpool *pool, void *job);
+void wpool_submit_sized(struct wpool *pool, void *job, size_t admission_bytes);
 /* Closes, drains, joins and frees the pool before ctx may be freed. NULL is valid. */
 void wpool_finish(struct wpool *pool);
 

@@ -1,25 +1,30 @@
-//! An ordered pool for opaque C jobs. A full ring retires its oldest job before
-//! reusing that worker, so each worker owns at most one pending job and sending
-//! never waits for space. Workers may finish out of order; completion callbacks
-//! run in submission order on the caller. Finish closes every input channel,
-//! drains pending results, then joins all workers before releasing the pool.
+//! Ordered pools for opaque C jobs. The legacy pool retires its oldest job on
+//! the caller before reusing a worker, so each worker owns at most one pending
+//! job and sends never wait for space. Workers may finish out of order; legacy
+//! done callbacks run in submission order on the caller. The windowed pool
+//! shares a FIFO input queue and limits jobs and estimated bytes at submission.
+//! Its dedicated writer runs done in submission order and releases admission
+//! credits only after done returns; workers never wait for output budget.
+//! Finish closes input, drains results, and joins all threads before ctx expires.
 
 use core::ffi::c_void;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 type Callback = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 struct Job(*mut c_void);
 // SAFETY: C transfers exclusive job access to one worker until work returns,
-// then to the caller's done callback, which may free it.
+// then to the ordered done callback, which may free it.
 unsafe impl Send for Job {}
 
 #[derive(Clone, Copy)]
 struct Context(*mut c_void);
 // SAFETY: C keeps ctx alive through finish and ensures any shared access is safe.
-// Work may use shared ctx only with synchronization; done runs on the caller.
+// Work and windowed done may use shared ctx only with synchronization.
 unsafe impl Send for Context {}
 
 impl Context {
@@ -34,7 +39,7 @@ struct Worker {
     thread: JoinHandle<()>,
 }
 
-pub struct WPool {
+struct RingPool {
     workers: Vec<Worker>,
     head: usize,
     pending: usize,
@@ -42,12 +47,49 @@ pub struct WPool {
     ctx: Context,
 }
 
+pub struct WPool {
+    mode: PoolMode,
+}
+
+enum PoolMode {
+    Ring(RingPool),
+    Windowed(WindowedPool),
+}
+
+struct WindowJob {
+    job: Job,
+    sequence: usize,
+    admission_bytes: usize,
+}
+
+struct WindowState {
+    jobs: VecDeque<WindowJob>,
+    closed: bool,
+    next_sequence: usize,
+    in_flight: usize,
+    admission_bytes: u128,
+}
+
+struct WindowShared {
+    state: Mutex<WindowState>,
+    input_ready: Condvar,
+    admission_ready: Condvar,
+    job_limit: usize,
+    byte_limit: u128,
+}
+
+struct WindowedPool {
+    shared: Arc<WindowShared>,
+    workers: Vec<JoinHandle<()>>,
+    writer: JoinHandle<()>,
+}
+
 fn failed(operation: &str, error: impl Display) -> ! {
     eprintln!("Failed to {operation} through Rust worker pool: {error}");
     std::process::exit(1);
 }
 
-impl WPool {
+impl RingPool {
     fn drain(&mut self) {
         let job = self.workers[self.head]
             .results
@@ -56,6 +98,20 @@ impl WPool {
         unsafe { self.ctx.call(self.done, &job) };
         self.head = (self.head + 1) % self.workers.len();
         self.pending -= 1;
+    }
+
+    fn submit(&mut self, job: Job) {
+        if self.pending == self.workers.len() {
+            self.drain();
+        }
+        let slot = (self.head + self.pending) % self.workers.len();
+        self.workers[slot]
+            .jobs
+            .as_ref()
+            .unwrap()
+            .send(job)
+            .unwrap_or_else(|e| failed("submit job", e));
+        self.pending += 1;
     }
 
     fn finish(mut self) {
@@ -71,6 +127,41 @@ impl WPool {
                 .join()
                 .unwrap_or_else(|_| failed("join worker", "thread panicked"));
         }
+    }
+}
+
+impl WindowedPool {
+    fn submit(&self, job: Job, admission_bytes: usize) {
+        let mut state = self.shared.state.lock().unwrap();
+        while state.in_flight >= self.shared.job_limit
+            || (state.in_flight != 0
+                && state.admission_bytes + admission_bytes as u128 > self.shared.byte_limit)
+        {
+            state = self.shared.admission_ready.wait(state).unwrap();
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        state.in_flight += 1;
+        state.admission_bytes += admission_bytes as u128;
+        state.jobs.push_back(WindowJob {
+            job,
+            sequence,
+            admission_bytes,
+        });
+        self.shared.input_ready.notify_one();
+    }
+
+    fn finish(self) {
+        self.shared.state.lock().unwrap().closed = true;
+        self.shared.input_ready.notify_all();
+        for worker in self.workers {
+            worker
+                .join()
+                .unwrap_or_else(|_| failed("join worker", "thread panicked"));
+        }
+        self.writer
+            .join()
+            .unwrap_or_else(|_| failed("join writer", "thread panicked"));
     }
 }
 
@@ -108,11 +199,99 @@ fn new_with_cpus(
         });
     }
     Box::into_raw(Box::new(WPool {
-        workers,
-        head: 0,
-        pending: 0,
-        done,
-        ctx,
+        mode: PoolMode::Ring(RingPool {
+            workers,
+            head: 0,
+            pending: 0,
+            done,
+            ctx,
+        }),
+    }))
+}
+
+fn new_windowed_with_cpus(
+    available: usize,
+    max: usize,
+    jobs_per_worker: usize,
+    byte_limit: usize,
+    work: Callback,
+    done: Callback,
+    ctx: *mut c_void,
+) -> *mut WPool {
+    let count = available.min(max);
+    if count < 2 {
+        return core::ptr::null_mut();
+    }
+    assert!(jobs_per_worker > 0);
+    let job_limit = count
+        .checked_mul(jobs_per_worker)
+        .unwrap_or_else(|| failed("size admission window", "job count overflow"));
+    let ctx = Context(ctx);
+    let shared = Arc::new(WindowShared {
+        state: Mutex::new(WindowState {
+            jobs: VecDeque::new(),
+            closed: false,
+            next_sequence: 0,
+            in_flight: 0,
+            admission_bytes: 0,
+        }),
+        input_ready: Condvar::new(),
+        admission_ready: Condvar::new(),
+        job_limit,
+        byte_limit: byte_limit as u128,
+    });
+    // The admission window bounds this channel and the reorder buffer together.
+    let (output, results) = channel::<WindowJob>();
+    let writer_shared = shared.clone();
+    let writer = thread::Builder::new()
+        .name("wprof_json_io".into())
+        .spawn(move || {
+            let mut next_sequence = 0;
+            let mut pending = BTreeMap::new();
+            while let Ok(job) = results.recv() {
+                pending.insert(job.sequence, job);
+                while let Some(job) = pending.remove(&next_sequence) {
+                    unsafe { ctx.call(done, &job.job) };
+                    next_sequence += 1;
+                    let mut state = writer_shared.state.lock().unwrap();
+                    state.in_flight -= 1;
+                    state.admission_bytes -= job.admission_bytes as u128;
+                    writer_shared.admission_ready.notify_one();
+                }
+            }
+        })
+        .unwrap_or_else(|e| failed("start writer", e));
+    let mut workers = Vec::with_capacity(count);
+    for i in 0..count {
+        let shared = shared.clone();
+        let output = output.clone();
+        workers.push(
+            thread::Builder::new()
+                .name(format!("wprof_pool{i}"))
+                .spawn(move || loop {
+                    let mut state = shared.state.lock().unwrap();
+                    while state.jobs.is_empty() && !state.closed {
+                        state = shared.input_ready.wait(state).unwrap();
+                    }
+                    let Some(job) = state.jobs.pop_front() else {
+                        break;
+                    };
+                    drop(state);
+                    unsafe { ctx.call(work, &job.job) };
+                    output
+                        .send(job)
+                        .unwrap_or_else(|e| failed("return completed job", e));
+                })
+                .unwrap_or_else(|e| failed("start worker", e)),
+        );
+    }
+    drop(output);
+    Box::into_raw(Box::new(WPool {
+        mode: PoolMode::Windowed(WindowedPool {
+            shared,
+            workers,
+            writer,
+        }),
     }))
 }
 
@@ -129,25 +308,51 @@ pub extern "C" fn wpool_new(
 }
 
 #[no_mangle]
+pub extern "C" fn wpool_new_windowed(
+    max_workers: usize,
+    jobs_per_worker: usize,
+    byte_limit: usize,
+    work: Callback,
+    done: Callback,
+    ctx: *mut c_void,
+) -> *mut WPool {
+    let available =
+        thread::available_parallelism().unwrap_or_else(|e| failed("query available CPUs", e));
+    new_windowed_with_cpus(
+        available.get(),
+        max_workers,
+        jobs_per_worker,
+        byte_limit,
+        work,
+        done,
+        ctx,
+    )
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn wpool_submit(pool: *mut WPool, job: *mut c_void) {
-    let pool = &mut *pool;
-    if pool.pending == pool.workers.len() {
-        pool.drain();
+    wpool_submit_sized(pool, job, 0);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wpool_submit_sized(
+    pool: *mut WPool,
+    job: *mut c_void,
+    admission_bytes: usize,
+) {
+    match &mut (*pool).mode {
+        PoolMode::Ring(pool) => pool.submit(Job(job)),
+        PoolMode::Windowed(pool) => pool.submit(Job(job), admission_bytes),
     }
-    let slot = (pool.head + pool.pending) % pool.workers.len();
-    pool.workers[slot]
-        .jobs
-        .as_ref()
-        .unwrap()
-        .send(Job(job))
-        .unwrap_or_else(|e| failed("submit job", e));
-    pool.pending += 1;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn wpool_finish(pool: *mut WPool) {
     if !pool.is_null() {
-        (*Box::from_raw(pool)).finish();
+        match Box::from_raw(pool).mode {
+            PoolMode::Ring(pool) => pool.finish(),
+            PoolMode::Windowed(pool) => pool.finish(),
+        }
     }
 }
 
@@ -176,6 +381,7 @@ mod tests {
         result: Option<u64>,
         worker: Option<ThreadId>,
         done_caller: ThreadId,
+        done_name: Option<String>,
     }
 
     #[derive(Default)]
@@ -208,6 +414,7 @@ mod tests {
             result: job.result,
             worker: job.worker,
             done_caller: thread::current().id(),
+            done_name: thread::current().name().map(str::to_owned),
         });
     }
 
@@ -341,6 +548,104 @@ mod tests {
                 wpool_finish(pool);
             }
             assert_eq!(ids(&out), (0..=selected).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn windowed_done_preserves_order_on_the_writer_thread() {
+        let caller = thread::current().id();
+        let gate = Arc::new(Gate::default());
+        let mut out = Output::default();
+        let pool = new_windowed_with_cpus(
+            2,
+            4,
+            4,
+            usize::MAX,
+            work,
+            done,
+            (&mut out as *mut Output).cast(),
+        );
+        unsafe {
+            for id in 0..8 {
+                wpool_submit_sized(pool, job(id, Some(gate.clone())), 1);
+            }
+            wpool_finish(pool);
+        }
+        assert_eq!(ids(&out), (0..8).collect::<Vec<_>>());
+        let work_order = gate.completed.lock().unwrap();
+        assert!(
+            work_order.iter().position(|&id| id == 1) < work_order.iter().position(|&id| id == 0)
+        );
+        for job in &out.jobs {
+            assert_eq!(job.result, Some(job.id as u64 * 3 + 1));
+            assert_ne!(job.worker, Some(caller));
+            assert_ne!(job.done_caller, caller);
+            assert_eq!(job.done_caller, out.jobs[0].done_caller);
+            assert_eq!(job.done_name.as_deref(), Some("wprof_json_io"));
+        }
+    }
+
+    struct WriterGate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+        done_count: usize,
+    }
+
+    unsafe extern "C" fn gated_done(ctx: *mut c_void, job: *mut c_void) {
+        let gate = &mut *ctx.cast::<WriterGate>();
+        let job = Box::from_raw(job.cast::<TestJob>());
+        if job.id == 0 {
+            gate.entered.send(()).unwrap();
+            gate.release.recv().unwrap();
+        }
+        gate.done_count += 1;
+    }
+
+    #[test]
+    fn windowed_admission_waits_until_done_returns_for_count_and_bytes() {
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Duration;
+
+        for (jobs_per_worker, byte_limit, cost, initial) in [(1, usize::MAX, 0, 2), (4, 5, 6, 1)] {
+            let (entered_tx, entered_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let (attempting_tx, attempting_rx) = channel();
+            let (submitted_tx, submitted_rx) = channel();
+            let submitter = thread::spawn(move || {
+                let mut gate = WriterGate {
+                    entered: entered_tx,
+                    release: release_rx,
+                    done_count: 0,
+                };
+                let pool = new_windowed_with_cpus(
+                    2,
+                    4,
+                    jobs_per_worker,
+                    byte_limit,
+                    work,
+                    gated_done,
+                    (&mut gate as *mut WriterGate).cast(),
+                );
+                unsafe {
+                    for id in 0..initial {
+                        wpool_submit_sized(pool, job(id, None), cost);
+                    }
+                    attempting_tx.send(()).unwrap();
+                    wpool_submit_sized(pool, job(initial, None), cost);
+                    submitted_tx.send(()).unwrap();
+                    wpool_finish(pool);
+                }
+                gate.done_count
+            });
+            entered_rx.recv().unwrap();
+            attempting_rx.recv().unwrap();
+            assert_eq!(
+                submitted_rx.recv_timeout(Duration::from_millis(20)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            release_tx.send(()).unwrap();
+            submitted_rx.recv().unwrap();
+            assert_eq!(submitter.join().unwrap(), initial + 1);
         }
     }
 }
