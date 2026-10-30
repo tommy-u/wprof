@@ -214,10 +214,8 @@ struct json_emit_record {
 };
 
 struct json_job {
-	struct json_job *next;
 	char *batch;
 	size_t batch_len;
-	size_t batch_capacity;
 	struct json_options options;
 	void *emit_ctx;
 	struct json_buf out;
@@ -263,12 +261,10 @@ struct json_state {
 	struct sbuf *task_cache;
 	size_t task_cache_cnt;
 	struct wpool *pool;
-	struct json_job *free_jobs;
 	struct json_writer_state writer;
 	void *emit_ctx;
 	bool no_parallel;
 	bool no_writer;
-	bool no_reuse;
 	bool no_worker_emitters;
 	bool direct_io;
 	bool nocow;
@@ -667,16 +663,8 @@ static inline void json_render(const char *data, size_t len, struct json_options
 	const unsigned char *p = (const unsigned char *)data;
 	const unsigned char *end = p + len;
 
-	if (!out->buffer.buf) {
-		out->buffer.buf = malloc(JSON_BUF_SZ);
-		out->buffer.cap = JSON_BUF_SZ;
-	}
+	*out = (struct json_buf) { .buffer = { .buf = malloc(JSON_BUF_SZ), .cap = JSON_BUF_SZ }, .options = options };
 	out->buffer.len = 0;
-	out->options = options;
-	out->float_zero_count = 0;
-	out->float_integer_count = 0;
-	out->float_fractional_count = 0;
-	out->float_fallback_count = 0;
 	struct json_state renderer = { .out = *out };
 
 	while (p < end) {
@@ -1009,16 +997,11 @@ static inline void json_direct_pack(struct json_writer_state *writer, const char
 	}
 }
 
-static inline void json_job_release(struct json_state *js, struct json_job *job)
+static inline void json_job_free(struct json_job *job)
 {
-	if (js->no_reuse) {
-		free(job->batch);
-		free(job->out.buffer.buf);
-		free(job);
-	} else {
-		job->next = js->free_jobs;
-		js->free_jobs = job;
-	}
+	free(job->batch);
+	free(job->out.buffer.buf);
+	free(job);
 }
 
 static inline void json_write_job(void *ctx, void *ptr)
@@ -1039,6 +1022,7 @@ static inline void json_write_job(void *ctx, void *ptr)
 			fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f);
 		}
 	}
+	json_job_free(job);
 }
 
 static void *json_writer_main(void *ctx)
@@ -1063,7 +1047,6 @@ static void *json_writer_main(void *ctx)
 		/* Keep draining after a failed write so producers cannot stay blocked. */
 		json_write_job(js, job);
 		pthread_mutex_lock(&writer->mutex);
-		json_job_release(js, job);
 	}
 	pthread_mutex_unlock(&writer->mutex);
 	if (writer->direct_active && !writer->error && writer->direct_len) {
@@ -1132,55 +1115,22 @@ static inline void json_done(void *ctx, void *ptr)
 		return;
 	}
 	json_write_job(js, job);
-	json_job_release(js, job);
 }
 
 static inline void json_submit(struct json_state *js)
 {
 	if (!js->batch_len)
 		return;
-	struct json_writer_state *writer = &js->writer;
+	struct json_job *job = calloc(1, sizeof(*job));
 
-	if (writer->started)
-		pthread_mutex_lock(&writer->mutex);
-	struct json_job *job = js->free_jobs;
-
-	if (job)
-		js->free_jobs = job->next;
-	if (writer->started)
-		pthread_mutex_unlock(&writer->mutex);
-	if (!job)
-		job = calloc(1, sizeof(*job));
-	/* A recycled job can still own a batch; preserve it before replacing the submitted buffer. */
-	char *spare = job->batch;
-	size_t spare_capacity = job->batch_capacity;
-
-	job->next = NULL;
 	job->batch = js->batch;
 	job->batch_len = js->batch_len;
-	job->batch_capacity = js->batch_capacity;
 	job->options = js->out.options;
 	job->emit_ctx = js->emit_ctx;
-	js->batch = spare;
+	js->batch = NULL;
 	js->batch_len = 0;
-	js->batch_capacity = spare_capacity;
+	js->batch_capacity = 0;
 	wpool_submit(js->pool, job);
-	/* A full pool retires a job during submit; borrow a written batch if we don't already have a spare. */
-	if (!js->no_reuse && !js->batch) {
-		if (writer->started)
-			pthread_mutex_lock(&writer->mutex);
-		for (job = js->free_jobs; job && !job->batch; job = job->next)
-			;
-		if (job) {
-			js->batch = job->batch;
-			js->batch_capacity = job->batch_capacity;
-			job->batch = NULL;
-			job->batch_len = 0;
-			job->batch_capacity = 0;
-		}
-		if (writer->started)
-			pthread_mutex_unlock(&writer->mutex);
-	}
 }
 
 static inline char *json_token_reserve(struct json_state *js, size_t n)
@@ -1386,21 +1336,6 @@ static inline int json_finish(struct json_state *js)
 			}
 		}
 		free(js->batch);
-		if (writer->started)
-			pthread_mutex_lock(&writer->mutex);
-		struct json_job *job = js->free_jobs;
-
-		js->free_jobs = NULL;
-		if (writer->started)
-			pthread_mutex_unlock(&writer->mutex);
-		while (job) {
-			struct json_job *next = job->next;
-
-			free(job->batch);
-			free(job->out.buffer.buf);
-			free(job);
-			job = next;
-		}
 		if (writer->started) {
 			pthread_cond_destroy(&writer->space);
 			pthread_cond_destroy(&writer->work);

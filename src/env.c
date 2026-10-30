@@ -164,7 +164,6 @@ static const struct {
 	{ "key-tokens", &env.json_no_key_tokens, false },
 	{ "literal-lengths", &env.json_no_literal_lengths, false },
 	{ "task-tokens", &env.json_no_task_tokens, false },
-	{ "reuse", &env.json_no_reuse, false },
 	{ "worker-emitters", &env.json_no_worker_emitters, false },
 	{ "writer", &env.json_no_writer, false },
 	{ "direct-io", &env.json_direct_io, true },
@@ -208,7 +207,7 @@ static const struct argp_option opts[] = {
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
-	  "task-tokens, reuse, worker-emitters, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
+	  "task-tokens, worker-emitters, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "json-workers", OPT_JSON_WORKERS, "N", 0, "JSON serializer workers (default: 16, capped to available CPUs; 1 disables parallel serialization)" },
 	{ "json-batch-size", OPT_JSON_BATCH_SIZE, "SIZE", 0, "JSON batch size; accepts units b/kb/mb/gb, bare number is bytes (default: 1mb; range: 1b..1gb)" },

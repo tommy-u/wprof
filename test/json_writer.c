@@ -5,7 +5,6 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -53,7 +52,6 @@ struct fixture {
 	int count;
 	int submitted;
 	int ids[25];
-	uintptr_t jobs[25];
 	uintptr_t buffers[25];
 	uintptr_t blocked_buffer;
 	char output[512];
@@ -150,7 +148,6 @@ static void emit_record(void *ctx, const void *event, const void *snapshot __unu
 
 	json_write(&js, records[id], strlen(records[id]));
 	*out = js.out;
-	f->jobs[id] = (uintptr_t)((char *)out - offsetof(struct json_job, out));
 	f->buffers[id] = (uintptr_t)out->buffer.buf;
 	assert(!f->in_write || f->buffers[id] != f->blocked_buffer);
 	pthread_mutex_unlock(&f->mutex);
@@ -214,8 +211,6 @@ static int gated_run(struct fixture *f, bool backpressure)
 		assert(f->js.writer.count == (backpressure ? 2 : 1));
 		if (!backpressure)
 			assert(f->js.writer.closing);
-		for (struct json_job *job = f->js.free_jobs; job; job = job->next)
-			assert((uintptr_t)job->out.buffer.buf != blocked);
 		for (size_t i = 0; i < f->js.writer.count; i++) {
 			struct json_job *job = f->js.writer.queue[(f->js.writer.head + i) % 2];
 
@@ -230,20 +225,6 @@ static int gated_run(struct fixture *f, bool backpressure)
 	assert(!pthread_join(producer, NULL));
 	if (skipped)
 		return 77;
-	if (backpressure) {
-		int distinct = 0;
-
-		for (int i = 0; i < f->count; i++) {
-			bool seen = false;
-
-			assert(f->jobs[i]);
-			for (int j = 0; j < i; j++)
-				seen |= f->jobs[i] == f->jobs[j];
-			distinct += !seen;
-		}
-		assert(distinct <= 20);
-		assert(distinct < f->count);
-	}
 	return 0;
 }
 
