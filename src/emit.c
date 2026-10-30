@@ -29,6 +29,7 @@
 static __thread struct json_state js;
 
 static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out);
+static void json_render_raw_request(void *ctx, const void *event, const void *snapshot, struct json_buf *out);
 
 _Static_assert(IID_NAME_TASK_STATE_LAST - IID_NAME_RUNNING + 1 == NR_WPROF_TASK_RUN_STATES,
 	       "task-state name IIDs must match enum wprof_task_run_state");
@@ -3644,6 +3645,10 @@ static int process_req_event(struct worker_state *w, const struct wevent *e)
 		return 0;
 	if (!env.capture_req_ctxs && (e->req.req_event == REQ_SET || e->req.req_event == REQ_UNSET))
 		return 0;
+	if (js.worker_requests) {
+		json_emit_reserve(&js, json_render_raw_request, e, 0);
+		return 0;
+	}
 
 	struct wprof_data_hdr *hdr = w->dump_hdr;
 	struct wprof_task task = wevent_resolve_task(hdr, e->task_id);
@@ -4033,6 +4038,10 @@ static int process_req_task_event(struct worker_state *w, const struct wevent *e
 {
 	if (!env.capture_requests || !env.capture_req_tasks)
 		return 0;
+	if (js.worker_requests) {
+		json_emit_reserve(&js, json_render_raw_request, e, 0);
+		return 0;
+	}
 
 	struct wprof_task task = wevent_resolve_task(w->dump_hdr, e->task_id);
 
@@ -4079,6 +4088,27 @@ static int process_req_task_event(struct worker_state *w, const struct wevent *e
 		emit_req_task_event(w, e, req_ctrs, req_oncpu_ns, req_offcpu_ns);
 	}
 	return 0;
+}
+
+static void json_render_raw_request(void *ctx, const void *event, const void *snapshot __unused, struct json_buf *out)
+{
+	struct worker_state *w = ctx;
+	const struct wevent *e = event;
+	struct wprof_task task = wevent_resolve_task(w->dump_hdr, e->task_id);
+	u64 req_id = e->kind == EV_REQ_EVENT ? e->req.req_id : e->req_task.req_id;
+
+	if (!should_trace_task(&task))
+		goto out;
+	if (w->req_allowlist.ids && !req_allowlist_has(&w->req_allowlist, task.pid, req_id))
+		goto out;
+	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
+	if (e->kind == EV_REQ_EVENT)
+		emit_req_event_json(w, e, NULL, 0, 0);
+	else
+		emit_req_task_event_json(w, e, NULL, 0, 0);
+	*out = js.out;
+out:
+	sfmt_reset();
 }
 
 static void json_render_event(void *ctx, const void *event, const void *snapshot, struct json_buf *out)
@@ -5988,6 +6018,15 @@ int emit_trace(struct worker_state *w)
 			js.batch_size = env.json_batch_size;
 		js.emit_ctx = w;
 		json_init(&js);
+		if (env.replay && js.pool && !js.no_worker_emitters && !env.json_no_worker_requests) {
+			if (env.req_pmu_layer != REQ_PMU_NONE || env.pmu_real_cnt || env.pmu_deriv_cnt) {
+				fprintf(stderr, "Warning: JSON request worker optimization is disabled for PMU traces; "
+					"using caller processing.\n");
+			} else {
+				js.worker_requests = true;
+				fprintf(stderr, "JSON request worker optimization: enabled\n");
+			}
+		}
 		emit_header_json(w);
 		if (env.requested_stack_traces)
 			emit_stacks_json(w);

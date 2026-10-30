@@ -120,6 +120,7 @@ enum {
 	OPT_JSON_DIRECT_IO = 1023,
 	OPT_JSON_OPT = 1024,
 	OPT_NO_JSON_OPT = 1025,
+	OPT_NO_JSON_WORKER_REQUESTS = 1026,
 
 	OPT_ALLOW_TID = 2000,
 	OPT_DENY_TID = 2001,
@@ -209,6 +210,8 @@ static const struct argp_option opts[] = {
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
 	  "task-tokens, worker-emitters, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
+	{ "no-json-worker-requests", OPT_NO_JSON_WORKER_REQUESTS, NULL, 0,
+	  "Disable worker processing of JSON request events" },
 	{ "json-workers", OPT_JSON_WORKERS, "N", 0, "JSON serializer workers (default: 16, capped to available CPUs; 1 disables parallel serialization)" },
 	{ "json-batch-size", OPT_JSON_BATCH_SIZE, "SIZE", 0, "JSON batch size; accepts units b/kb/mb/gb, bare number is bytes (default: 1mb; range: 1b..1gb)" },
 	{ "json-direct-io", OPT_JSON_DIRECT_IO, NULL, 0,
@@ -528,6 +531,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 				key == OPT_JSON_OPT ? "json-opt" : "no-json-opt");
 			return -EINVAL;
 		}
+		break;
+	case OPT_NO_JSON_WORKER_REQUESTS:
+		env.json_no_worker_requests = true;
 		break;
 	case OPT_JSON_WORKERS: {
 		char *end;

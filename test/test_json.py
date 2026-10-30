@@ -98,6 +98,15 @@ class JsonOptionsTest(unittest.TestCase):
         self.assertNotIn(b"unrecognized option", result.stderr)
         self.assertIn(b"/missing-json-test.data", result.stderr)
 
+    def test_worker_request_disable_flag_is_accepted_before_opening_data(self):
+        result = subprocess.run(
+            [str(WPROF), "-R", "-D", "/missing-json-test.data", "-J", "-", "--no-json-worker-requests"],
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(b"unrecognized option", result.stderr)
+        self.assertIn(b"/missing-json-test.data", result.stderr)
+
     def test_invalid_json_tuning_values_report_the_flag_and_range(self):
         for flag, values, range_text in (
             ("--json-workers", (

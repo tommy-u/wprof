@@ -229,6 +229,7 @@ struct json_state {
 	bool no_parallel;
 	bool no_writer;
 	bool no_worker_emitters;
+	bool worker_requests;
 	bool direct_io;
 	bool nocow;
 	size_t max_workers;
