@@ -5948,46 +5948,79 @@ static void emit_header_json(struct worker_state *w)
 	json_obj_end(j);
 }
 
-static void emit_stacks_json(struct worker_state *w)
+static void emit_stack_json(struct worker_state *w, const struct wstack_trace_record *trec)
 {
 	struct json_state *j = &js;
 	struct wprof_data_hdr *hdr = w->dump_hdr;
 	char frame_buf[1024];
 
-	struct wstack_trace_record *trec;
-	wstack_for_each_trace(trec, hdr, 0) {
-		json_obj_start(j);
-		json_kv_int_id(j, JSON_KEY_ID, trec->idx);
+	json_obj_start(j);
+	json_kv_int_id(j, JSON_KEY_ID, trec->idx);
 
-		json_subarr_start_id(j, JSON_KEY_FRAMES);
-		bool has_src = false;
+	json_subarr_start_id(j, JSON_KEY_FRAMES);
+	bool has_src = false;
+	for (int i = 0; i < trec->frame_cnt; i++) {
+		const struct wstack_frame *f = wstack_frame(hdr, trec->frame_ids[i]);
+		const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
+		json_arr_str(j, name);
+		if (!has_src && f->src_path_stroff) {
+			const char *src = wstack_str(hdr, f->src_path_stroff);
+			if (src && src[0])
+				has_src = true;
+		}
+	}
+	json_arr_end(j);
+
+	if (has_src) {
+		json_subarr_start_id(j, JSON_KEY_SRCS);
 		for (int i = 0; i < trec->frame_cnt; i++) {
 			const struct wstack_frame *f = wstack_frame(hdr, trec->frame_ids[i]);
-			const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
-			json_arr_str(j, name);
-			if (!has_src && f->src_path_stroff) {
-				const char *src = wstack_str(hdr, f->src_path_stroff);
-				if (src && src[0])
-					has_src = true;
-			}
+			const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+			if (src && src[0] && f->line_num > 0)
+				json_arr_fmt(j, "%s:%u", src, f->line_num);
+			else
+				json_arr_str(j, "");
 		}
 		json_arr_end(j);
-
-		if (has_src) {
-			json_subarr_start_id(j, JSON_KEY_SRCS);
-			for (int i = 0; i < trec->frame_cnt; i++) {
-				const struct wstack_frame *f = wstack_frame(hdr, trec->frame_ids[i]);
-				const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
-				if (src && src[0] && f->line_num > 0)
-					json_arr_fmt(j, "%s:%u", src, f->line_num);
-				else
-					json_arr_str(j, "");
-			}
-			json_arr_end(j);
-		}
-
-		json_obj_end(j);
 	}
+
+	json_obj_end(j);
+}
+
+static void json_render_stack(void *ctx, const void *event __unused, const void *snapshot, struct json_buf *out)
+{
+	struct wstack_trace_record trec;
+
+	memcpy(&trec, snapshot, sizeof(trec));
+	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
+	emit_stack_json(ctx, &trec);
+	*out = js.out;
+	sfmt_reset();
+}
+
+static void emit_stacks_json(struct worker_state *w)
+{
+	struct json_state *j = &js;
+	struct wprof_data_hdr *hdr = w->dump_hdr;
+	bool worker_stacks = j->pool && !env.json_no_worker_stacks;
+	struct wstack_trace_record *trec;
+
+	wstack_for_each_trace(trec, hdr, 0) {
+		if (!worker_stacks) {
+			emit_stack_json(w, trec);
+			continue;
+		}
+		size_t units = trec->frame_cnt ? trec->frame_cnt : 1;
+
+		if (units > 1024 || units > 1024 - j->stack_frame_units)
+			json_submit(j);
+		memcpy(json_emit_reserve(j, json_render_stack, NULL, sizeof(*trec)), trec, sizeof(*trec));
+		j->stack_frame_units += units;
+		if (units > 1024)
+			json_submit(j);
+	}
+	if (worker_stacks)
+		json_submit(j);
 }
 
 int emit_trace(struct worker_state *w)

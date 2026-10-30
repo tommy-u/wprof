@@ -166,6 +166,7 @@ static const struct {
 	{ "literal-lengths", &env.json_no_literal_lengths, false },
 	{ "task-tokens", &env.json_no_task_tokens, false },
 	{ "worker-emitters", &env.json_no_worker_emitters, false },
+	{ "worker-stacks", &env.json_no_worker_stacks, false },
 	{ "writer", &env.json_no_writer, false },
 	{ "direct-io", &env.json_direct_io, true },
 	{ "nocow", &env.json_nocow, true },
@@ -208,7 +209,7 @@ static const struct argp_option opts[] = {
 	{ "json-trace", 'J', "FILE", 0, "Emit JSON trace for programmatic analysis (use '-' for stdout; see --json-schema)" },
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
-	  "task-tokens, worker-emitters, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
+	  "task-tokens, worker-emitters, worker-stacks, writer, direct-io, nocow, all (last setting wins; direct-io and nocow default off)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "no-json-worker-requests", OPT_NO_JSON_WORKER_REQUESTS, NULL, 0,
 	  "Disable worker processing of JSON request events" },
