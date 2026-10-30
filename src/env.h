@@ -238,6 +238,7 @@ struct env {
 	bool json_no_parallel;
 	bool json_no_writer;
 	bool json_no_work_window;
+	bool json_no_frame_name_limit;
 	bool json_no_key_tokens;
 	bool json_no_literal_lengths;
 	bool json_no_task_tokens;

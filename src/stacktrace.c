@@ -1353,6 +1353,8 @@ const char *format_stack_frame(struct wprof_data_hdr *hdr, const struct wstack_f
 
 	const char *prefix = (f->flags & WSF_PYTHON) ? "Py" : (f->flags & WSF_KERNEL) ? "K" : "U";
 	const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+	/* snprintf processes discarded name bytes too; precision bounds that work. */
+	int name_len = env.json_no_frame_name_limit ? -1 : (int)(buf_sz - 1);
 
 	if ((f->flags & WSF_PYTHON) && (fmt & CS_FMT_PY_SRC) && src && src[0] && f->line_num > 0) {
 		/* strip container overlay prefix: /dev/shm/.../...-ns-NNNNN/path → path */
@@ -1367,15 +1369,16 @@ const char *format_stack_frame(struct wprof_data_hdr *hdr, const struct wstack_f
 		if (stripped)
 			src = stripped + 11; /* strlen("#link-tree/") == 11 */
 		if (env.emit_pystacks_only)
-			snprintf(buf, buf_sz, "%s (%s:%u)", sym_name, src, f->line_num);
+			snprintf(buf, buf_sz, "%.*s (%s:%u)", name_len, sym_name, src, f->line_num);
 		else
-			snprintf(buf, buf_sz, "[%s] %s (%s:%u)", prefix, sym_name, src, f->line_num);
+			snprintf(buf, buf_sz, "[%s] %.*s (%s:%u)", prefix, name_len, sym_name, src, f->line_num);
 	} else {
 		const char *inlined = (f->flags & WSF_INLINED) ? " (inlined)" : "";
 		if ((fmt & CS_FMT_FUNC_OFFSET) && f->func_offset)
-			snprintf(buf, buf_sz, "[%s] %s+0x%llx%s", prefix, sym_name, (unsigned long long)f->func_offset, inlined);
+			snprintf(buf, buf_sz, "[%s] %.*s+0x%llx%s", prefix, name_len, sym_name,
+				 (unsigned long long)f->func_offset, inlined);
 		else
-			snprintf(buf, buf_sz, "[%s] %s%s", prefix, sym_name, inlined);
+			snprintf(buf, buf_sz, "[%s] %.*s%s", prefix, name_len, sym_name, inlined);
 	}
 	return buf;
 }
