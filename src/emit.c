@@ -6137,6 +6137,9 @@ int emit_trace(struct worker_state *w)
 		js.no_worker_emitters = env.json_no_worker_emitters;
 		js.direct_io = env.json_direct_io;
 		js.nocow = env.json_nocow;
+		js.io_uring = env.json_io_uring;
+		js.io_depth = env.json_io_depth;
+		js.preallocate_size = env.json_preallocate_size;
 		if (env.json_workers)
 			js.max_workers = env.json_workers;
 		if (env.json_batch_size)

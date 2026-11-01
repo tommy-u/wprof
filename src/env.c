@@ -57,6 +57,7 @@ enum log_subset env_log_set;
 
 struct env env = {
 	.data_path = "wprof.data",
+	.json_io_depth = 4,
 	.ringbuf_sz = DEFAULT_RINGBUF_SZ,
 	.ringbuf_cnt = 0,
 	.task_state_sz = -1,	/* resolved to a backend-specific default in setup_bpf() */
@@ -121,6 +122,8 @@ enum {
 	OPT_JSON_OPT = 1024,
 	OPT_NO_JSON_OPT = 1025,
 	OPT_NO_JSON_WORKER_REQUESTS = 1026,
+	OPT_JSON_IO_DEPTH = 1027,
+	OPT_JSON_PREALLOCATE_SIZE = 1028,
 
 	OPT_ALLOW_TID = 2000,
 	OPT_DENY_TID = 2001,
@@ -172,6 +175,7 @@ static const struct {
 	{ "frame-name-limit", &env.json_no_frame_name_limit, false },
 	{ "direct-io", &env.json_direct_io, true },
 	{ "nocow", &env.json_nocow, true },
+	{ "io-uring", &env.json_io_uring, true },
 };
 
 static int set_json_optimization(const char *name, bool enabled)
@@ -179,6 +183,9 @@ static int set_json_optimization(const char *name, bool enabled)
 	bool all = strcasecmp(name, "all") == 0;
 
 	for (size_t i = 0; i < sizeof(json_optimizations) / sizeof(json_optimizations[0]); i++) {
+		/* Keep the new backend opt-in until its experiment has measured a gain. */
+		if (all && enabled && json_optimizations[i].value == &env.json_io_uring)
+			continue;
 		if (all || strcasecmp(name, json_optimizations[i].name) == 0) {
 			*json_optimizations[i].value = enabled ? json_optimizations[i].enabled_value : !json_optimizations[i].enabled_value;
 			if (!all)
@@ -212,12 +219,14 @@ static const struct argp_option opts[] = {
 	{ "json-opt", OPT_JSON_OPT, "NAME", 0,
 	  "Enable JSON optimization: buffering, integers, timestamps, parallel, key-tokens, literal-lengths, "
 	  "task-tokens, worker-emitters, worker-stacks, writer, work-window, frame-name-limit, direct-io, nocow, all "
-	  "(last setting wins; direct-io and nocow default off)" },
+	  "(last setting wins; direct-io and nocow default off; experimental io-uring is opt-in and excluded from all)" },
 	{ "no-json-opt", OPT_NO_JSON_OPT, "NAME", 0, "Disable the named JSON optimization (or all)" },
 	{ "no-json-worker-requests", OPT_NO_JSON_WORKER_REQUESTS, NULL, 0,
 	  "Disable worker processing of JSON request events" },
 	{ "json-workers", OPT_JSON_WORKERS, "N", 0, "JSON serializer workers (default: 16, capped to available CPUs; 1 disables parallel serialization)" },
 	{ "json-batch-size", OPT_JSON_BATCH_SIZE, "SIZE", 0, "JSON batch size; accepts units b/kb/mb/gb, bare number is bytes (default: 1mb; range: 1b..1gb)" },
+	{ "json-io-depth", OPT_JSON_IO_DEPTH, "N", 0, "Experimental io_uring buffer depth (default: 4; range: 2..8); does not enable io-uring" },
+	{ "json-preallocate-size", OPT_JSON_PREALLOCATE_SIZE, "SIZE", 0, "Experimental direct JSON output preallocation hint; 0 disables (default); allocation is included in export time" },
 	{ "json-direct-io", OPT_JSON_DIRECT_IO, NULL, 0,
 	  "Shorthand for --json-opt direct-io --json-opt nocow; disables output data checksums and compression on Btrfs" },
 	{ "json-schema", OPT_JSON_SCHEMA, NULL, 0, "Print JSON output data model/schema and exit" },
@@ -577,6 +586,30 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env.json_direct_io = true;
 		env.json_nocow = true;
 		break;
+	case OPT_JSON_IO_DEPTH: {
+		char *end;
+		unsigned long long depth;
+
+		errno = 0;
+		depth = strtoull(arg, &end, 10);
+		if (arg[0] < '0' || arg[0] > '9' || errno || *end || depth < 2 || depth > 8) {
+			eprintf("Invalid --json-io-depth '%s': expected an integer in range 2..8\n", arg);
+			return -EINVAL;
+		}
+		env.json_io_depth = depth;
+		break;
+	}
+	case OPT_JSON_PREALLOCATE_SIZE: {
+		u64 size;
+
+		errno = 0;
+		if (parse_size(arg, SZ_B, &size) || errno == ERANGE || size > LLONG_MAX - 4095ULL) {
+			eprintf("Invalid --json-preallocate-size '%s': expected a nonnegative output size\n", arg);
+			return -EINVAL;
+		}
+		env.json_preallocate_size = size;
+		break;
+	}
 	case OPT_JSON_SCHEMA: {
 		extern const char json_schema_start[];
 		extern const char json_schema_end[];

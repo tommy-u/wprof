@@ -228,6 +228,8 @@ struct env {
 	char *json_path;
 	size_t json_workers;
 	size_t json_batch_size;
+	unsigned json_io_depth;
+	u64 json_preallocate_size;
 	enum seal_kind seals;		/* bitmask */
 
 	bool pb_debug_interns;
@@ -246,6 +248,7 @@ struct env {
 	bool json_no_worker_stacks;
 	bool json_no_worker_requests;
 	bool json_direct_io;
+	bool json_io_uring;
 	bool json_nocow;
 	bool keep_workdir;
 	bool raw_stacks;

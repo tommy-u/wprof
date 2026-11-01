@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <linux/magic.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 
 #include "wrust.h"
+#include "json_uring.h"
 
 /*
  * LOW-LEVEL JSON BUILDER PRIMITIVES
@@ -238,6 +240,8 @@ struct json_writer_state {
 	size_t direct_len;
 	unsigned long long direct_bytes;
 	unsigned long long direct_writes;
+	struct json_uring *uring;
+	unsigned uring_slot;
 	pthread_mutex_t mutex;
 	pthread_cond_t work;
 	pthread_cond_t space;
@@ -271,6 +275,9 @@ struct json_state {
 	bool worker_requests;
 	bool direct_io;
 	bool nocow;
+	bool io_uring;
+	unsigned io_depth;
+	uint64_t preallocate_size;
 	size_t max_workers;
 	size_t batch_size;
 	char *batch;
@@ -962,9 +969,67 @@ fallback:
 	json_direct_fallback(reason);
 }
 
-static inline void json_direct_write(struct json_writer_state *writer, size_t len)
+static inline void json_uring_start(struct json_state *js)
 {
+	struct json_writer_state *writer = &js->writer;
+	unsigned depth = js->io_depth ? js->io_depth : 4;
+	int ret;
+
+	if (!js->work_window || !writer->direct_active) {
+		fprintf(stderr, "JSON io_uring: enabled=0 reason=windowed direct I/O writer is unavailable\n");
+		return;
+	}
+	ret = json_uring_create(&writer->uring, writer->fd, depth, JSON_DIRECT_CHUNK_SZ,
+				JSON_DIRECT_MEM_ALIGN, JSON_DIRECT_ALIGN);
+	if (ret) {
+		fprintf(stderr, "JSON io_uring: enabled=0 synchronous_direct=1 errno=%d reason=%s\n", -ret, strerror(-ret));
+		return;
+	}
+	free(writer->direct_data);
+	writer->direct_data = NULL;
+	fprintf(stderr, "JSON io_uring: enabled depth=%u chunk=%d normal_sqes=1\n", depth, JSON_DIRECT_CHUNK_SZ);
+}
+
+static inline void json_preallocate(struct json_state *js)
+{
+	struct json_writer_state *writer = &js->writer;
+	uint64_t size = (js->preallocate_size + JSON_DIRECT_ALIGN - 1) / JSON_DIRECT_ALIGN * JSON_DIRECT_ALIGN;
+	int ret;
+
+	if (!js->preallocate_size || writer->error)
+		return;
+	if (!writer->direct_active) {
+		writer->error = EINVAL;
+		fprintf(stderr, "JSON preallocation: failed reason=direct I/O writer is unavailable\n");
+		return;
+	}
+	do {
+		ret = fallocate(writer->fd, 0, 0, size);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		writer->error = errno;
+		fprintf(stderr, "JSON preallocation: failed requested_bytes=%llu error=%s\n",
+			(unsigned long long)js->preallocate_size, strerror(writer->error));
+		return;
+	}
+	fprintf(stderr, "JSON preallocation: enabled requested_bytes=%llu allocated_bytes=%llu\n",
+		(unsigned long long)js->preallocate_size, (unsigned long long)size);
+}
+
+static inline void json_direct_write(struct json_state *js, size_t len)
+{
+	struct json_writer_state *writer = &js->writer;
 	const char *data = writer->direct_data;
+
+	if (writer->uring) {
+		int ret = json_uring_submit(writer->uring, writer->uring_slot, len, writer->direct_offset);
+
+		writer->direct_data = NULL;
+		writer->direct_offset += len;
+		if (ret && !writer->error)
+			writer->error = -ret;
+		return;
+	}
 
 	while (len) {
 		ssize_t ret = pwrite(writer->fd, data, len, writer->direct_offset);
@@ -987,9 +1052,20 @@ static inline void json_direct_write(struct json_writer_state *writer, size_t le
 	}
 }
 
-static inline void json_direct_pack(struct json_writer_state *writer, const char *data, size_t len)
+static inline void json_direct_pack(struct json_state *js, const char *data, size_t len)
 {
+	struct json_writer_state *writer = &js->writer;
+
 	while (len && !writer->error) {
+		if (writer->uring && !writer->direct_data) {
+			int slot = json_uring_acquire(writer->uring, (void **)&writer->direct_data);
+
+			if (slot < 0) {
+				writer->error = -slot;
+				return;
+			}
+			writer->uring_slot = slot;
+		}
 		size_t n = JSON_DIRECT_CHUNK_SZ - writer->direct_len;
 
 		if (n > len)
@@ -999,7 +1075,7 @@ static inline void json_direct_pack(struct json_writer_state *writer, const char
 		data += n;
 		len -= n;
 		if (writer->direct_len == JSON_DIRECT_CHUNK_SZ) {
-			json_direct_write(writer, writer->direct_len);
+			json_direct_write(js, writer->direct_len);
 			writer->direct_len = 0;
 		}
 	}
@@ -1026,20 +1102,23 @@ static inline void json_write_job(void *ctx, void *ptr)
 	if (!writer->error) {
 		writer->logical_size += job->out.buffer.len;
 		if (writer->direct_active)
-			json_direct_pack(writer, job->out.buffer.buf, job->out.buffer.len);
+			json_direct_pack(js, job->out.buffer.buf, job->out.buffer.len);
 		else if (fwrite(job->out.buffer.buf, 1, job->out.buffer.len, js->out.f) != (size_t)job->out.buffer.len)
 			writer->error = errno ? errno : EIO;
 	}
 	json_job_free(job);
 }
 
-static inline void json_writer_tail(struct json_writer_state *writer)
+static inline void json_writer_tail(struct json_state *js)
 {
+	struct json_writer_state *writer = &js->writer;
+
 	if (writer->direct_active && !writer->error && writer->direct_len) {
 		size_t len = (writer->direct_len + JSON_DIRECT_ALIGN - 1) / JSON_DIRECT_ALIGN * JSON_DIRECT_ALIGN;
 
 		memset(writer->direct_data + writer->direct_len, 0, len - writer->direct_len);
-		json_direct_write(writer, len);
+		json_direct_write(js, len);
+		writer->direct_len = 0;
 	}
 }
 
@@ -1066,7 +1145,7 @@ static void *json_writer_main(void *ctx)
 		pthread_mutex_lock(&writer->mutex);
 	}
 	pthread_mutex_unlock(&writer->mutex);
-	json_writer_tail(writer);
+	json_writer_tail(js);
 	return NULL;
 }
 
@@ -1338,6 +1417,9 @@ static inline void json_init(struct json_state *js)
 	}
 	if (!js->pool && js->direct_io)
 		json_direct_fallback("parallel JSON writer is unavailable");
+	if (js->io_uring)
+		json_uring_start(js);
+	json_preallocate(js);
 }
 
 static inline int json_finish(struct json_state *js)
@@ -1354,11 +1436,27 @@ static inline int json_finish(struct json_state *js)
 			pthread_mutex_unlock(&writer->mutex);
 			pthread_join(writer->thread, NULL);
 		} else if (js->work_window) {
-			json_writer_tail(writer);
+			json_writer_tail(js);
+		}
+		bool idle = true;
+
+		if (writer->uring) {
+			struct json_uring_stats stats;
+			int ret = json_uring_drain(writer->uring);
+
+			if (ret && !writer->error)
+				writer->error = -ret;
+			idle = json_uring_idle(writer->uring);
+			json_uring_get_stats(writer->uring, &stats);
+			writer->direct_bytes = stats.completed_bytes;
+			writer->direct_writes = stats.completed;
+			fprintf(stderr, "JSON io_uring: %s submitted=%llu completed=%llu completed_bytes=%llu peak_pending=%u idle=%d\n",
+				writer->error ? "failed" : "completed", stats.submitted, stats.completed,
+				stats.completed_bytes, stats.peak_pending, idle);
 		}
 		if (writer->direct_active) {
 			/* The aligned last write can extend EOF; expose only the actual JSON bytes. */
-			if (!writer->error) {
+			if (!writer->error && idle) {
 				int ret;
 
 				do {
@@ -1367,10 +1465,17 @@ static inline int json_finish(struct json_state *js)
 				if (ret)
 					writer->error = errno;
 			}
-			json_direct_restore_fd(writer);
-			if (fseeko(js->out.f, writer->logical_size, SEEK_SET) && !writer->error)
-				writer->error = errno;
-			free(writer->direct_data);
+			if (idle) {
+				json_direct_restore_fd(writer);
+				if (fseeko(js->out.f, writer->logical_size, SEEK_SET) && !writer->error)
+					writer->error = errno;
+			}
+			if (writer->uring) {
+				json_uring_destroy(writer->uring);
+				writer->uring = NULL;
+			} else {
+				free(writer->direct_data);
+			}
 			writer->direct_data = NULL;
 		}
 		free(js->batch);
