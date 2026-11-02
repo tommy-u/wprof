@@ -28,12 +28,14 @@ enum json_token {
 	JSON_TOKEN_KEY_COMMA = 0x86,
 	JSON_TOKEN_QUOTED = 0x87,
 	JSON_TOKEN_RAW = 0x90,
+	JSON_TOKEN_EMIT = 0x88,
 };
 
 struct json_state {
 	FILE *f;
 	struct sbuf out;
 	struct wpool *pool;
+	void *emit_ctx;
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
@@ -42,9 +44,18 @@ struct json_state {
 	int cnt[5]; /* comma tracking per level */
 };
 
+typedef void (*json_emit_fn)(struct json_state *js, void *ctx, const void *event, const void *snapshot);
+
+struct json_emit_record {
+	json_emit_fn emit;
+	const void *event;
+	size_t snapshot_len;
+};
+
 struct json_job {
 	char *batch;
 	size_t batch_len;
+	void *emit_ctx;
 	struct sbuf out;
 };
 
@@ -368,6 +379,15 @@ static inline void json_render(struct json_state *js, const char *data, size_t l
 			json_ts(js, ns);
 			break;
 		}
+		case JSON_TOKEN_EMIT: {
+			struct json_emit_record record;
+
+			memcpy(&record, p, sizeof(record));
+			p += sizeof(record);
+			record.emit(js, js->emit_ctx, record.event, p);
+			p += record.snapshot_len;
+			break;
+		}
 		case JSON_TOKEN_STRING:
 			p = (const unsigned char *)json_puts(js, (const char *)p) + 1;
 			break;
@@ -400,6 +420,7 @@ static inline void json_work(void *ctx, void *ptr)
 	(void)ctx;
 	struct json_state render = JSON_STATE_INIT(NULL);
 
+	render.emit_ctx = job->emit_ctx;
 	json_render(&render, job->batch, job->batch_len);
 	job->out = render.out;
 }
@@ -421,7 +442,7 @@ static inline void json_submit(struct json_state *js)
 		return;
 	struct json_job *job = malloc(sizeof(*job));
 
-	*job = (struct json_job) { .batch = js->batch, .batch_len = js->batch_len };
+	*job = (struct json_job) { .batch = js->batch, .batch_len = js->batch_len, .emit_ctx = js->emit_ctx };
 	js->batch = NULL;
 	js->batch_len = 0;
 	js->batch_capacity = 0;
@@ -467,6 +488,18 @@ static inline void json_fragment(struct json_state *js, const void *data, size_t
 	} else {
 		json_write(js, data, n);
 	}
+}
+
+/* Event and context pointers remain valid through finish; snapshots are copied into the batch. */
+static inline char *json_emit_reserve(struct json_state *js, json_emit_fn emit, const void *event, size_t snapshot_len)
+{
+	struct json_emit_record record = { .emit = emit, .event = event, .snapshot_len = snapshot_len };
+	char *p = json_token_reserve(js, 1 + sizeof(record) + snapshot_len);
+
+	*p = JSON_TOKEN_EMIT;
+	p++;
+	memcpy(p, &record, sizeof(record));
+	return p + sizeof(record);
 }
 
 static inline void json_token_string(struct json_state *js, enum json_token token, const char *s)
