@@ -4,6 +4,8 @@
 #include "strs.h"
 #include "wrust.h"
 
+#define JSON_FLUSH_SZ (1024 * 1024)
+
 /*
  * LOW-LEVEL JSON BUILDER PRIMITIVES
  *
@@ -827,7 +829,7 @@ static inline void json_obj_end(struct json_state *js)
 	js->lvl--;
 	if (js->lvl < 0) { /* outermost level, emit newline */
 		json_literal(js, "}\n", 2);
-		if (!js->pool && js->f)
+		if (!js->pool && js->f && js->out.len >= JSON_FLUSH_SZ)
 			json_flush(js);
 	} else
 		json_char(js, '}');
