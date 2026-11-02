@@ -763,7 +763,7 @@ static inline void json_render(const char *data, size_t len, struct json_options
 
 			memcpy(&record, p, sizeof(record));
 			p += sizeof(record);
-			record.emit(emit_ctx, record.event, p, &renderer.out);
+			record.emit(emit_ctx, record.event, record.snapshot_len ? p : NULL, &renderer.out);
 			p += record.snapshot_len;
 			break;
 		}
