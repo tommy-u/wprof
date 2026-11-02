@@ -573,7 +573,7 @@ static inline void json_value_ts(struct json_state *js, u64 ns)
 
 static inline void json_init(struct json_state *js)
 {
-	js->pool = wpool_new(4, json_work, json_done, js->f);
+	js->pool = wpool_new(16, json_work, json_done, js->f);
 	if (js->pool) {
 		js->batch = malloc(JSON_BUF_SZ);
 		js->batch_capacity = JSON_BUF_SZ;
