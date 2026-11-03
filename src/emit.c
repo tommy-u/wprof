@@ -4816,9 +4816,11 @@ static int process_cuda_api(struct worker_state *w, const struct wevent *e)
 	if (task.tid == 0)
 		return 0;
 
-	/* remember host-side API call timestamp */
-	struct cuda_corr_info *ci = cuda_corr_get(task.pid, e->cuda_api.corr_id);
-	ci->api_ts = e->ts;
+	if (!env.json_path) {
+		/* remember host-side API call timestamp */
+		struct cuda_corr_info *ci = cuda_corr_get(task.pid, e->cuda_api.corr_id);
+		ci->api_ts = e->ts;
+	}
 
 	if (env.json_path)
 		json_emit_event(w, e, NULL, 0);
