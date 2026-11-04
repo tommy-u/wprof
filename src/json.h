@@ -60,6 +60,10 @@ struct json_state {
 	int lvl;
 	enum json_scope scope[5];
 	int cnt[5]; /* comma tracking per level */
+	u64 float_zero_count;
+	u64 float_integer_count;
+	u64 float_fractional_count;
+	u64 float_fallback_count;
 };
 
 typedef void (*json_emit_fn)(struct json_state *js, void *ctx, const void *event, const void *snapshot);
@@ -221,9 +225,62 @@ static inline void json_float(struct json_state *js, const char *fmt, double val
 {
 	char buf[32];
 
-	if (strcmp(fmt, "%.6lf") == 0 && json_fixed6(js, value))
-		return;
+	if (!strcmp(fmt, "%.6lf")) {
+		u64 bits;
 
+		memcpy(&bits, &value, sizeof(bits));
+		u64 magnitude = bits & 0x7fffffffffffffffULL;
+		if (magnitude < (1066ULL << 52)) { /* finite and abs(value) < 2^43 */
+			unsigned exponent = magnitude >> 52;
+			u64 significand = magnitude & ((1ULL << 52) - 1);
+			int shift = 1074;
+
+			if (exponent) {
+				significand |= 1ULL << 52;
+				shift = 1075 - exponent;
+			}
+			if (!magnitude)
+				js->float_zero_count++;
+			else if (shift < 64 && !(significand & ((1ULL << shift) - 1)))
+				js->float_integer_count++;
+			else
+				js->float_fractional_count++;
+
+			/* Exact value in millionths is significand * 1000000 / 2^shift. */
+			__uint128_t scaled = (__uint128_t)significand * 1000000;
+			u64 units = 0;
+
+			if (shift < 128) {
+				units = scaled >> shift;
+				__uint128_t remainder = scaled & (((__uint128_t)1 << shift) - 1);
+				__uint128_t half = (__uint128_t)1 << (shift - 1);
+
+				if (remainder > half || (remainder == half && (units & 1)))
+					units++;
+			}
+			u64 whole = units / 1000000;
+			u64 fraction = units % 1000000;
+			/* Reserve seven bytes for the dot and six fractional digits. */
+			char *p = json_decimal(buf, sizeof(buf) - 7, whole);
+			char *last = buf + sizeof(buf) - 1;
+			char *end = last;
+
+			buf[sizeof(buf) - 8] = '.';
+			for (int i = 0; i < 6; i++) {
+				--end;
+				*end = '0' + fraction % 10;
+				fraction /= 10;
+			}
+			*last = '\0';
+			if (bits >> 63) {
+				--p;
+				*p = '-';
+			}
+			json_write(js, p, last - p);
+			return;
+		}
+		js->float_fallback_count++;
+	}
 	int n = snprintf(buf, sizeof(buf), fmt, value);
 
 	if (n < 0)
@@ -697,6 +754,12 @@ static inline void json_finish(struct json_state *js)
 	for (size_t i = 0; i < js->task_cache_cnt; i++)
 		sbuf_free(&js->task_cache[i]);
 	free(js->task_cache);
+	if (js->float_zero_count + js->float_integer_count + js->float_fractional_count + js->float_fallback_count)
+		fprintf(stderr, "JSON float paths: zero=%llu integer=%llu fractional=%llu printf=%llu\n",
+			(unsigned long long)js->float_zero_count,
+			(unsigned long long)js->float_integer_count,
+			(unsigned long long)js->float_fractional_count,
+			(unsigned long long)js->float_fallback_count);
 }
 
 static inline void json_str(struct json_state *js, const char *value)
