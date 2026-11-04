@@ -410,24 +410,16 @@ static inline void json_arr_elem(struct json_state *js)
 	js->cnt[js->lvl]++;
 }
 
+static inline void json_arr_raw(struct json_state *js, const struct sbuf *fragment)
+{
+	json_arr_elem(js);
+	json_raw(js, fragment);
+}
+
 static inline void json_arr_str(struct json_state *js, const char *value)
 {
 	json_arr_elem(js);
 	json_str(js, value);
-}
-
-__attribute__((format(printf, 2, 3)))
-static inline void json_arr_fmt(struct json_state *js, const char *fmt, ...)
-{
-	json_arr_elem(js);
-	json_putc(js, '"');
-
-	va_list ap;
-	va_start(ap, fmt);
-	json_vprintf(js, fmt, ap);
-	va_end(ap);
-
-	json_putc(js, '"');
 }
 
 __unused

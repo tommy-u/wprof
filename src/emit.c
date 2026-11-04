@@ -5806,11 +5806,42 @@ static void emit_header_json(struct worker_state *w)
 	json_obj_end(j);
 }
 
+struct json_frame {
+	struct sbuf name;
+	struct sbuf src;
+	bool has_src;
+};
+
+static struct json_frame render_frame_json(struct wprof_data_hdr *hdr, u32 id)
+{
+	const struct wstack_frame *f = wstack_frame(hdr, id);
+	char frame_buf[1024];
+	const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
+	const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+	struct json_frame frame = { .has_src = src && src[0] };
+	struct json_state fragment;
+
+	json_frag_start(&fragment);
+	json_str(&fragment, name);
+	frame.name = json_frag_end(&fragment);
+	if (frame.has_src && f->line_num > 0) {
+		json_frag_start(&fragment);
+		json_fmt(&fragment, "%s:%u", src, f->line_num);
+		frame.src = json_frag_end(&fragment);
+	}
+	return frame;
+}
+
 static void emit_stacks_json(struct worker_state *w)
 {
 	struct json_state *j = &js;
 	struct wprof_data_hdr *hdr = w->dump_hdr;
-	char frame_buf[1024];
+	struct wstack_hdr *shdr = wstack_hdr(hdr);
+
+	if (!shdr)
+		return;
+	size_t frame_cnt = shdr->frame_cnt;
+	struct json_frame *cache = calloc(frame_cnt, sizeof(*cache));
 
 	struct wstack_trace_record *trec;
 	wstack_for_each_trace(trec, hdr, 0) {
@@ -5820,24 +5851,20 @@ static void emit_stacks_json(struct worker_state *w)
 		json_subarr_start(j, "frames");
 		bool has_src = false;
 		for (int i = 0; i < trec->frame_cnt; i++) {
-			const struct wstack_frame *f = wstack_frame(hdr, trec->frame_ids[i]);
-			const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
-			json_arr_str(j, name);
-			if (!has_src && f->src_path_stroff) {
-				const char *src = wstack_str(hdr, f->src_path_stroff);
-				if (src && src[0])
-					has_src = true;
-			}
+			u32 id = trec->frame_ids[i];
+			if (!cache[id].name.len)
+				cache[id] = render_frame_json(hdr, id);
+			json_arr_raw(j, &cache[id].name);
+			has_src |= cache[id].has_src;
 		}
 		json_arr_end(j);
 
 		if (has_src) {
 			json_subarr_start(j, "srcs");
 			for (int i = 0; i < trec->frame_cnt; i++) {
-				const struct wstack_frame *f = wstack_frame(hdr, trec->frame_ids[i]);
-				const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
-				if (src && src[0] && f->line_num > 0)
-					json_arr_fmt(j, "%s:%u", src, f->line_num);
+				u32 id = trec->frame_ids[i];
+				if (cache[id].src.len)
+					json_arr_raw(j, &cache[id].src);
 				else
 					json_arr_str(j, "");
 			}
@@ -5846,6 +5873,11 @@ static void emit_stacks_json(struct worker_state *w)
 
 		json_obj_end(j);
 	}
+	for (size_t i = 0; i < frame_cnt; i++) {
+		sbuf_free(&cache[i].name);
+		sbuf_free(&cache[i].src);
+	}
+	free(cache);
 }
 
 int emit_trace(struct worker_state *w)
