@@ -277,6 +277,23 @@ static inline void json_puts(struct json_state *js, const char *s)
 	}
 }
 
+static inline void json_str(struct json_state *js, const char *value)
+{
+	json_putc(js, '"');
+	json_puts(js, value);
+	json_putc(js, '"');
+}
+
+static inline void json_bool(struct json_state *js, bool value)
+{
+	json_write(js, value ? "true" : "false", value ? 4 : 5);
+}
+
+static inline void json_null(struct json_state *js)
+{
+	json_write(js, "null", 4);
+}
+
 static inline void json_vprintf(struct json_state *js, const char *fmt, va_list ap)
 {
 	char buf[256];
@@ -298,6 +315,19 @@ static inline void json_vprintf(struct json_state *js, const char *fmt, va_list 
 		free(heap);
 	}
 	va_end(ap2);
+}
+
+__attribute__((format(printf, 2, 3)))
+static inline void json_fmt(struct json_state *js, const char *fmt, ...)
+{
+	json_putc(js, '"');
+
+	va_list ap;
+	va_start(ap, fmt);
+	json_vprintf(js, fmt, ap);
+	va_end(ap);
+
+	json_putc(js, '"');
 }
 
 static inline void json_obj_start(struct json_state *js)
@@ -329,69 +359,34 @@ static inline void json_key(struct json_state *js, const char *key)
 	js->cnt[js->lvl]++;
 }
 
-static inline void json_subobj_start(struct json_state *js, const char *key)
+static inline void json_literal_field(struct json_state *js, const char *text, size_t len)
 {
-	json_key(js, key);
-	json_obj_start(js);
+	if (js->cnt[js->lvl])
+		json_putc(js, ',');
+	json_write(js, text, len);
+	js->cnt[js->lvl]++;
 }
 
-static inline void json_kv_str(struct json_state *js, const char *key, const char *value)
-{
-	json_key(js, key);
-	json_putc(js, '"');
-	json_puts(js, value);
-	json_putc(js, '"');
-}
-
-__attribute__((format(printf, 3, 4)))
-static inline void json_kv_fmt(struct json_state *js, const char *key, const char *fmt, ...)
-{
-	json_key(js, key);
-	json_putc(js, '"');
-
-	va_list ap;
-	va_start(ap, fmt);
-	json_vprintf(js, fmt, ap);
-	va_end(ap);
-
-	json_putc(js, '"');
-}
-
-static inline void json_kv_int(struct json_state *js, const char *key, long long value)
-{
-	json_key(js, key);
-	json_int(js, value);
-}
-
-static inline void json_kv_uint(struct json_state *js, const char *key, unsigned long long value)
-{
-	json_key(js, key);
-	json_uint(js, value);
-}
-
-static inline void json_kv_null(struct json_state *js, const char *key)
-{
-	json_key(js, key);
-	json_write(js, "null", 4);
-}
-
-static inline void json_kv_float(struct json_state *js, const char *key, const char *fmt, double value)
-{
-	json_key(js, key);
-	json_float(js, fmt, value);
-}
-
-static inline void json_kv_ts(struct json_state *js, const char *key, u64 ns)
-{
-	json_key(js, key);
-	json_ts(js, ns);
-}
-
-static inline void json_kv_bool(struct json_state *js, const char *key, bool value)
-{
-	json_key(js, key);
-	json_write(js, value ? "true" : "false", value ? 4 : 5);
-}
+#define json_key_literal(js, key) \
+	json_literal_field(js, "\"" key "\":", sizeof("\"" key "\":") - 1)
+#define json_kv_const_str(js, key, value) \
+	json_literal_field(js, "\"" key "\":\"" value "\"", sizeof("\"" key "\":\"" value "\"") - 1)
+#define json_kv_int(js, key, value) \
+	do { json_key_literal(js, key); json_int(js, value); } while (0)
+#define json_kv_ts(js, key, value) \
+	do { json_key_literal(js, key); json_ts(js, value); } while (0)
+#define json_kv_str(js, key, value) \
+	do { json_key_literal(js, key); json_str(js, value); } while (0)
+#define json_kv_bool(js, key, value) \
+	do { json_key_literal(js, key); json_bool(js, value); } while (0)
+#define json_kv_float(js, key, fmt, value) \
+	do { json_key_literal(js, key); json_float(js, fmt, value); } while (0)
+#define json_kv_fmt(js, key, ...) \
+	do { json_key_literal(js, key); json_fmt(js, __VA_ARGS__); } while (0)
+#define json_subarr_start(js, key) \
+	do { json_key_literal(js, key); json_arr_start(js); } while (0)
+#define json_subobj_start(js, key) \
+	do { json_key_literal(js, key); json_obj_start(js); } while (0)
 
 static inline void json_arr_start(struct json_state *js)
 {
@@ -408,12 +403,6 @@ static inline void json_arr_end(struct json_state *js)
 	json_putc(js, ']');
 }
 
-static inline void json_subarr_start(struct json_state *js, const char *key)
-{
-	json_key(js, key);
-	json_arr_start(js);
-}
-
 static inline void json_arr_elem(struct json_state *js)
 {
 	if (js->cnt[js->lvl])
@@ -424,9 +413,7 @@ static inline void json_arr_elem(struct json_state *js)
 static inline void json_arr_str(struct json_state *js, const char *value)
 {
 	json_arr_elem(js);
-	json_putc(js, '"');
-	json_puts(js, value);
-	json_putc(js, '"');
+	json_str(js, value);
 }
 
 __attribute__((format(printf, 2, 3)))
@@ -460,5 +447,5 @@ __unused
 static inline void json_arr_null(struct json_state *js)
 {
 	json_arr_elem(js);
-	json_write(js, "null", 4);
+	json_null(js);
 }
