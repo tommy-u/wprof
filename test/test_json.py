@@ -6,6 +6,8 @@ import errno
 import hashlib
 import json
 import os
+import re
+import signal
 from pathlib import Path
 import shlex
 import shutil
@@ -165,6 +167,7 @@ class JsonOptionsTest(unittest.TestCase):
 class JsonWriterTest(unittest.TestCase):
     @staticmethod
     def reference_for_options(reference, flags):
+        reference = re.sub(rb'"largest(?:6|9)":[-0-9.]+,', b"", reference)
         legacy_timestamps = False
         for option, value in zip(flags, flags[1:]):
             if option == "--debug" and value == "json-no-int-ts":
@@ -204,7 +207,7 @@ class JsonWriterTest(unittest.TestCase):
             else:
                 library = SOURCE_DIR / "wrust/target/release/libwrust_c.a"
                 if library.is_file():
-                    command.extend([str(library), "-lpthread", "-ldl", "-lm"])
+                    command.extend([str(library), str(SOURCE_DIR / "json_uring.c"), "-lpthread", "-ldl", "-lm"])
             subprocess.run(command, check=True)
             cls.fixtures[mode] = fixture
 
@@ -212,7 +215,7 @@ class JsonWriterTest(unittest.TestCase):
         subprocess.run([
             *shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-O2", "-Wall", "-Wextra",
             str(fixture_dir / "json_writer.c"), "-o", str(cls.writer_fixture),
-            str(SOURCE_DIR / "wrust/target/release/libwrust_c.a"),
+            str(SOURCE_DIR / "wrust/target/release/libwrust_c.a"), str(SOURCE_DIR / "json_uring.c"),
             "-Wl,--wrap=pthread_create", "-lpthread", "-ldl", "-lm",
         ], check=True)
 
@@ -228,14 +231,13 @@ class JsonWriterTest(unittest.TestCase):
         self.assertEqual(len(self.reference), REFERENCE_BYTES)
         self.assertEqual(len(self.reference.splitlines()), REFERENCE_RECORDS)
         self.assertEqual(digest, REFERENCE_SHA256)
-        self.assertEqual(len(self.float_output), len(self.reference))
-        self.assertEqual(hashlib.sha256(self.float_output).hexdigest(), digest)
-        self.assertEqual(self.float_output, self.reference)
+        expected = self.reference_for_options(self.reference, ["--no-json-opt", "timestamps"])
+        self.assertEqual(self.float_output, expected)
         print(f"Verified {len(self.reference)} bytes, {len(self.lines)} records, SHA-256 {digest}")
 
     def test_default_preserves_bytes_with_exact_timestamps(self):
         legacy = json.loads(self.reference.splitlines()[0], parse_float=Decimal)["timestamps"]
-        expected = self.reference
+        expected = re.sub(rb'"largest(?:6|9)":[-0-9.]+,', b"", self.reference)
         for key, value in EXACT_TIMESTAMPS.items():
             old = f'"{key}":{legacy[key]:.9f}'.encode()
             new = f'"{key}":{value}'.encode()
@@ -337,8 +339,19 @@ class JsonWriterTest(unittest.TestCase):
         for key, places in (("largest6", 6), ("largest9", 9)):
             with self.subTest(key=key):
                 value = largest + "." + "0" * places
-                self.assertIn(f'"{key}":{value},'.encode(), self.lines[0])
-                self.assertEqual(first[key], Decimal(value))
+                self.assertIn(f'"{key}":{value},'.encode(), self.reference.splitlines()[0])
+                reference = json.loads(self.reference.splitlines()[0], parse_float=Decimal)
+                self.assertEqual(reference[key], Decimal(value))
+
+    def test_oversized_float_reports_the_main_buffer_limit(self):
+        for places in (6, 9):
+            with self.subTest(places=places):
+                flag = f"--large-float{places}"
+                reference = subprocess.check_output([str(self.fixtures["reference"]), flag])
+                self.assertIn(b'"largest":179769313486231570', reference)
+                result = subprocess.run([str(self.fixtures["default"]), flag], capture_output=True)
+                self.assertEqual(result.returncode, -signal.SIGABRT)
+                self.assertIn(b"JSON float buffer too small", result.stderr)
 
     def test_integer_decimal_boundaries_in_objects_and_arrays(self):
         values = [

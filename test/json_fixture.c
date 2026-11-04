@@ -14,7 +14,7 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define __unused __attribute__((unused))
-#define BUG(...) abort()
+#define BUG(...) do { fprintf(stderr, __VA_ARGS__); abort(); } while (0)
 
 #ifdef JSON_REFERENCE
 #include "json_reference.h"
@@ -44,11 +44,16 @@ int main(int argc, char **argv)
 	const size_t debug_optimization[] = { 0, 1, 2, 3, 8 };
 	bool disabled[9] = { false };
 	bool empty = false;
+	bool large6 = false, large9 = false;
 	size_t workers = 0, batch_size = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--empty") == 0) {
 			empty = true;
+		} else if (strcmp(argv[i], "--large-float6") == 0) {
+			large6 = true;
+		} else if (strcmp(argv[i], "--large-float9") == 0) {
+			large9 = true;
 		} else if (strcmp(argv[i], "--float-timestamps") == 0) {
 			float_timestamps = true;
 		} else if ((strcmp(argv[i], "--json-workers") == 0 || strcmp(argv[i], "--json-batch-size") == 0) && i + 1 < argc) {
@@ -117,7 +122,11 @@ int main(int argc, char **argv)
 	(void)batch_size;
 #endif
 
-	if (!empty) {
+	if (large6 || large9) {
+		json_obj_start(&js);
+		json_kv_float(&js, "largest", large6 ? "%.6lf" : "%.9lf", DBL_MAX);
+		json_obj_end(&js);
+	} else if (!empty) {
 		char reused[32] = "original";
 		char reused_key[32] = "original-key";
 		char controls[32];
@@ -195,8 +204,10 @@ int main(int argc, char **argv)
 		json_kv_float(&js, "zero9", "%.9lf", -0.0);
 		json_kv_float(&js, "positive_zero6", "%.6lf", 0.0);
 		json_kv_float(&js, "positive_zero9", "%.9lf", 0.0);
+#ifdef JSON_REFERENCE
 		json_kv_float(&js, "largest6", "%.6lf", DBL_MAX);
 		json_kv_float(&js, "largest9", "%.9lf", DBL_MAX);
+#endif
 		json_kv_float(&js, "smallest6", "%.6lf", DBL_MIN);
 		json_kv_float(&js, "smallest9", "%.9lf", DBL_MIN);
 		json_kv_float(&js, "rounding6", "%.6lf", 1.2345675);

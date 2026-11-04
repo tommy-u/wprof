@@ -19,7 +19,7 @@ class JsonCallbackTest(unittest.TestCase):
         subprocess.run([
             *shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-O2", "-Wall", "-Wextra",
             str(ROOT / "test/json_callback_fixture.c"), "-o", str(cls.binary),
-            str(ROOT / "src/wrust/target/release/libwrust_c.a"), "-lpthread", "-ldl", "-lm",
+            str(ROOT / "src/wrust/target/release/libwrust_c.a"), str(ROOT / "src/json_uring.c"), "-lpthread", "-ldl", "-lm",
         ], check=True)
 
     def test_exact_timestamps_and_owned_output_on_workers_and_caller(self):
