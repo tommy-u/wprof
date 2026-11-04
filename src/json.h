@@ -83,9 +83,74 @@ static inline void json_uint(struct json_state *js, unsigned long long value)
 	json_write(js, p, end - p);
 }
 
+/*
+ * Write value exactly as printf("%.6lf") would in the C locale with the default
+ * rounding mode. Return false without writing if value is not finite or
+ * abs(value) >= 2^43. This conservative bound keeps millionths in a u64 and
+ * signed output within the 21-byte buffer.
+ */
+static inline bool json_fixed6(struct json_state *js, double value)
+{
+	u64 bits;
+
+	memcpy(&bits, &value, sizeof(bits));
+	unsigned exponent = (bits >> 52) & 0x7ff; /* biased by 1023; 0x7ff is inf/NaN */
+	if (exponent >= 1023 + 43)
+		return false;
+
+	/*
+	 * printf rounds the exact binary value, so llround(value * 1e6) can differ
+	 * near ties. Count millionths exactly in integers instead, rounding ties to
+	 * even like printf. Anything below 2^-21 (including zero and subnormals) is
+	 * under half a millionth and rounds to zero.
+	 */
+	u64 units = 0;
+
+	if (exponent >= 1023 - 21) {
+		/* abs(value) == significand / 2^shift exactly, with shift in [10, 73] */
+		u64 significand = (bits & ((1ULL << 52) - 1)) | (1ULL << 52);
+		int shift = 1023 + 52 - exponent;
+		__uint128_t scaled = (__uint128_t)significand * 1000000;
+		__uint128_t rem = scaled & (((__uint128_t)1 << shift) - 1);
+		__uint128_t half = (__uint128_t)1 << (shift - 1);
+
+		units = scaled >> shift;
+		if (rem > half || (rem == half && (units & 1)))
+			units++;
+	}
+
+	/* sign + 13 whole digits (< 2^43) + '.' + 6 fraction digits, written backward */
+	u64 whole = units / 1000000, frac = units % 1000000;
+	char buf[21], *end = buf + sizeof(buf), *p = end;
+
+	for (int i = 0; i < 6; i++) {
+		--p;
+		*p = '0' + frac % 10;
+		frac /= 10;
+	}
+	--p;
+	*p = '.';
+	do {
+		--p;
+		*p = '0' + whole % 10;
+		whole /= 10;
+	} while (whole);
+	/* Like printf, keep the sign of -0.0 and of negatives that round to zero. */
+	if (bits >> 63) {
+		--p;
+		*p = '-';
+	}
+	json_write(js, p, end - p);
+	return true;
+}
+
 static inline void json_float(struct json_state *js, const char *fmt, double value)
 {
 	char buf[32];
+
+	if (strcmp(fmt, "%.6lf") == 0 && json_fixed6(js, value))
+		return;
+
 	int n = snprintf(buf, sizeof(buf), fmt, value);
 
 	if (n < 0)
