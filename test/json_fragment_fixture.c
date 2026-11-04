@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+#define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
