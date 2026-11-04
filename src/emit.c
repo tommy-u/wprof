@@ -5990,8 +5990,9 @@ static void emit_stacks_json(struct worker_state *w)
 				u32 id = trec->frame_ids[i];
 				if (cache[id].src.len)
 					json_arr_raw(j, &cache[id].src);
-				else
+				else {
 					json_arr_str(j, "");
+				}
 			}
 			json_arr_end(j);
 		}
