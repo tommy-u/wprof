@@ -565,7 +565,7 @@ static inline void json_token_data(struct json_state *js, enum json_token token,
 /* Cached fragments may contain UTF-8 bytes that overlap token IDs. */
 static inline void json_fragment(struct json_state *js, const void *data, size_t n)
 {
-	if (js->deferred) {
+	if (js->pool) {
 		char *p = json_token_reserve(js, 1 + sizeof(n) + n);
 
 		*p = JSON_TOKEN_RAW;
@@ -925,4 +925,16 @@ static inline void json_arr_null(struct json_state *js)
 {
 	json_arr_elem(js);
 	json_literal(js, "null", 4);
+}
+
+static inline void json_subobj_start(struct json_state *js, const char *key)
+{
+	json_key(js, key);
+	json_obj_start(js);
+}
+
+static inline void json_subarr_start(struct json_state *js, const char *key)
+{
+	json_key(js, key);
+	json_arr_start(js);
 }
