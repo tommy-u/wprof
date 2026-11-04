@@ -23,6 +23,20 @@ struct json_state {
 
 #define JSON_STATE_INIT(file) { .f = (file), .lvl = -1 }
 
+static inline void json_frag_start(struct json_state *js)
+{
+	/* Keep fragments nested so closing an object does not flush an NDJSON record. */
+	*js = (struct json_state){ .lvl = 0 };
+}
+
+static inline struct sbuf json_frag_end(struct json_state *js)
+{
+	struct sbuf out = js->out;
+
+	js->out = sbuf_new();
+	return out;
+}
+
 static inline void json_flush(struct json_state *js)
 {
 	fwrite(js->out.buf, 1, js->out.len, js->f);
@@ -37,6 +51,11 @@ static inline void json_finish(struct json_state *js)
 static inline void json_write(struct json_state *js, const void *p, size_t n)
 {
 	sbuf_append(&js->out, p, n);
+}
+
+static inline void json_raw(struct json_state *js, const struct sbuf *fragment)
+{
+	json_write(js, fragment->buf, fragment->len);
 }
 
 static inline void json_putc(struct json_state *js, char c)

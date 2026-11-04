@@ -215,6 +215,7 @@ struct wprof_task {
 	u32 pid;
 	u32 ppid;
 	u32 flags;
+	u32 task_id; /* recorded task metadata index */
 	const char *comm;
 	const char *pcomm;
 };

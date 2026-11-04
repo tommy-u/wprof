@@ -26,6 +26,7 @@
 #include "json.h"
 
 static __thread struct json_state js;
+static __thread struct sbuf *task_objs;
 
 _Static_assert(IID_NAME_TASK_STATE_LAST - IID_NAME_RUNNING + 1 == NR_WPROF_TASK_RUN_STATES,
 	       "task-state name IIDs must match enum wprof_task_run_state");
@@ -1607,17 +1608,32 @@ static bool should_trace_task(const struct wprof_task *task)
 	return true;
 }
 
-static void json_task(struct json_state *j, const char *key, const struct wprof_task *t)
+static void json_task_object(struct json_state *j, const struct wprof_task *t)
 {
 	int tid = task_tid(t);
 
-	json_subobj_start(j, key);
+	json_obj_start(j);
 	if (tid)
 		json_kv_int(j, "tid", tid);
 	json_kv_int(j, "pid", t->pid);
 	json_kv_str(j, "comm", t->comm);
 	json_kv_str(j, "pcomm", t->pcomm);
 	json_obj_end(j);
+}
+
+static void json_task(struct json_state *j, const char *key, const struct wprof_task *t)
+{
+	struct sbuf *obj = &task_objs[t->task_id];
+
+	if (!obj->len) {
+		struct json_state fragment;
+
+		json_frag_start(&fragment);
+		json_task_object(&fragment, t);
+		*obj = json_frag_end(&fragment);
+	}
+	json_key(j, key);
+	json_raw(j, obj);
 }
 
 /* EV_TIMER */
@@ -5835,6 +5851,7 @@ int emit_trace(struct worker_state *w)
 	js = (struct json_state)JSON_STATE_INIT(env.json_path ? w->trace : NULL);
 
 	if (env.json_path) {
+		task_objs = calloc(w->dump_hdr->thread_cnt, sizeof(*task_objs));
 		emit_header_json(w);
 		if (env.requested_stack_traces)
 			emit_stacks_json(w);
@@ -5867,8 +5884,13 @@ int emit_trace(struct worker_state *w)
 	}
 
 	err = process_events(w, emit_fns, ARRAY_SIZE(emit_fns));
-	if (env.json_path)
+	if (env.json_path) {
+		for (size_t i = 0; i < w->dump_hdr->thread_cnt; i++)
+			sbuf_free(&task_objs[i]);
+		free(task_objs);
+		task_objs = NULL;
 		json_finish(&js);
+	}
 	if (err)
 		return err;
 
