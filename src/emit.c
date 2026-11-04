@@ -6214,11 +6214,6 @@ struct json_stack_cache {
 	size_t frame_cnt;
 };
 
-struct json_stack_snapshot {
-	struct wstack_trace_record trace;
-	const struct json_frame_fragment *frames;
-};
-
 static void init_json_stack_cache(struct worker_state *w, struct json_stack_cache *cache)
 {
 	struct wprof_data_hdr *hdr = w->dump_hdr;
@@ -6230,7 +6225,7 @@ static void init_json_stack_cache(struct worker_state *w, struct json_stack_cach
 	cache->frame_cnt = shdr->frame_cnt;
 	cache->frames = calloc(cache->frame_cnt, sizeof(*cache->frames));
 
-	/* Fill fragments before stack jobs can read them. */
+	/* The serial path owns these fragments; worker jobs format frames directly. */
 	struct wstack_trace_record *trec;
 	wstack_for_each_trace(trec, hdr, 0) {
 		for (int i = 0; i < trec->frame_cnt; i++) {
@@ -6265,9 +6260,12 @@ static void free_json_stack_cache(struct json_stack_cache *cache)
 	free(cache->frames);
 }
 
-static void emit_stack_json(const struct wstack_trace_record *trec, const struct json_frame_fragment *cache)
+static void emit_stack_json(struct worker_state *w, const struct wstack_trace_record *trec,
+			    const struct json_frame_fragment *cache)
 {
 	struct json_state *j = &js;
+	struct wprof_data_hdr *hdr = w->dump_hdr;
+	char frame_buf[1024];
 
 	json_obj_start(j);
 	json_kv_int_id(j, JSON_KEY_ID, trec->idx);
@@ -6277,9 +6275,18 @@ static void emit_stack_json(const struct wstack_trace_record *trec, const struct
 	for (int i = 0; i < trec->frame_cnt; i++) {
 		u32 id = trec->frame_ids[i];
 
-		json_arr_elem(j);
-		json_fragment(j, cache[id].name.buf, cache[id].name.len);
-		has_src |= cache[id].has_src;
+		if (cache) {
+			json_arr_elem(j);
+			json_fragment(j, cache[id].name.buf, cache[id].name.len);
+			has_src |= cache[id].has_src;
+		} else {
+			const struct wstack_frame *f = wstack_frame(hdr, id);
+			const char *name = format_stack_frame(hdr, f, frame_buf, sizeof(frame_buf), CS_FMT_FUNC_OFFSET);
+			const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+
+			json_arr_str(j, name);
+			has_src |= src && src[0];
+		}
 	}
 	json_arr_end(j);
 
@@ -6288,11 +6295,21 @@ static void emit_stack_json(const struct wstack_trace_record *trec, const struct
 		for (int i = 0; i < trec->frame_cnt; i++) {
 			u32 id = trec->frame_ids[i];
 
-			if (cache[id].src.buf) {
-				json_arr_elem(j);
-				json_fragment(j, cache[id].src.buf, cache[id].src.len);
+			if (cache) {
+				if (cache[id].src.buf) {
+					json_arr_elem(j);
+					json_fragment(j, cache[id].src.buf, cache[id].src.len);
+				} else {
+					json_arr_str(j, "");
+				}
 			} else {
-				json_arr_str(j, "");
+				const struct wstack_frame *f = wstack_frame(hdr, id);
+				const char *src = f->src_path_stroff ? wstack_str(hdr, f->src_path_stroff) : NULL;
+
+				if (src && src[0] && f->line_num > 0)
+					json_arr_fmt(j, "%s:%u", src, f->line_num);
+				else
+					json_arr_str(j, "");
 			}
 		}
 		json_arr_end(j);
@@ -6301,14 +6318,14 @@ static void emit_stack_json(const struct wstack_trace_record *trec, const struct
 	json_obj_end(j);
 }
 
-static void json_render_stack(void *ctx __unused, const void *event __unused,
+static void json_render_stack(void *ctx, const void *event __unused,
 			      const void *snapshot, struct json_buf *out)
 {
-	struct json_stack_snapshot stack;
+	struct wstack_trace_record trec;
 
-	memcpy(&stack, snapshot, sizeof(stack));
+	memcpy(&trec, snapshot, sizeof(trec));
 	js = (struct json_state) { .out = *out, .lvl = -1, .no_parallel = true };
-	emit_stack_json(&stack.trace, stack.frames);
+	emit_stack_json(ctx, &trec, NULL);
 	*out = js.out;
 	sfmt_reset();
 }
@@ -6320,18 +6337,18 @@ static void emit_stacks_json(struct worker_state *w, struct json_stack_cache *ca
 	bool worker_stacks = j->pool && !env.json_no_worker_stacks;
 	struct wstack_trace_record *trec;
 
-	init_json_stack_cache(w, cache);
+	if (!worker_stacks)
+		init_json_stack_cache(w, cache);
 	wstack_for_each_trace(trec, hdr, 0) {
 		if (!worker_stacks) {
-			emit_stack_json(trec, cache->frames);
+			emit_stack_json(w, trec, cache->frames);
 			continue;
 		}
 		size_t units = trec->frame_cnt ? trec->frame_cnt : 1;
-		struct json_stack_snapshot stack = { .trace = *trec, .frames = cache->frames };
 
 		if (units > 1024 || units > 1024 - j->stack_frame_units)
 			json_submit(j);
-		memcpy(json_emit_reserve(j, json_render_stack, NULL, sizeof(stack)), &stack, sizeof(stack));
+		memcpy(json_emit_reserve(j, json_render_stack, NULL, sizeof(*trec)), trec, sizeof(*trec));
 		j->stack_frame_units += units;
 		if (units > 1024)
 			json_submit(j);
