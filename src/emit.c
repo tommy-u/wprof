@@ -26,7 +26,6 @@
 #include "json.h"
 
 static __thread struct json_state js;
-static __thread struct sbuf *task_objs;
 
 static void json_render_event(struct json_state *out, void *ctx, const void *event, const void *snapshot);
 
@@ -1625,22 +1624,21 @@ static void json_task_object(struct json_state *j, const struct wprof_task *t)
 
 static void json_task(struct json_state *j, const char *key, const struct wprof_task *t)
 {
-	if (!task_objs) {
-		json_key(j, key);
+	json_key(j, key);
+	if (!j->task_cache || !t->data_task_id) {
 		json_task_object(j, t);
 		return;
 	}
-	struct sbuf *obj = &task_objs[t->task_id];
 
-	if (!obj->len) {
-		struct json_state fragment;
+	struct sbuf *cached = &j->task_cache[t->data_task_id];
+	if (!cached->buf) {
+		/* Start nested so closing the fragment does not flush an NDJSON record. */
+		struct json_state fragment = { .lvl = 0 };
 
-		json_frag_start(&fragment);
 		json_task_object(&fragment, t);
-		*obj = json_frag_end(&fragment);
+		*cached = fragment.out;
 	}
-	json_key(j, key);
-	json_raw(j, obj);
+	json_fragment(j, cached->buf, cached->len);
 }
 
 /* EV_TIMER */
@@ -6016,7 +6014,8 @@ int emit_trace(struct worker_state *w)
 	js = (struct json_state)JSON_STATE_INIT(env.json_path ? w->trace : NULL);
 
 	if (env.json_path) {
-		task_objs = calloc(w->dump_hdr->thread_cnt, sizeof(*task_objs));
+		js.task_cache_cnt = w->dump_hdr->threads_sz / sizeof(struct wevent_task) + 1;
+		js.task_cache = calloc(js.task_cache_cnt, sizeof(*js.task_cache));
 		js.emit_ctx = w;
 		json_init(&js);
 		emit_header_json(w);
@@ -6052,10 +6051,6 @@ int emit_trace(struct worker_state *w)
 
 	err = process_events(w, emit_fns, ARRAY_SIZE(emit_fns));
 	if (env.json_path) {
-		for (size_t i = 0; i < w->dump_hdr->thread_cnt; i++)
-			sbuf_free(&task_objs[i]);
-		free(task_objs);
-		task_objs = NULL;
 		json_finish(&js);
 	}
 	if (err)

@@ -55,6 +55,8 @@ struct json_state {
 	char *batch;
 	size_t batch_len;
 	size_t batch_capacity;
+	struct sbuf *task_cache;
+	size_t task_cache_cnt;
 	int lvl;
 	enum json_scope scope[5];
 	int cnt[5]; /* comma tracking per level */
@@ -692,6 +694,9 @@ static inline void json_finish(struct json_state *js)
 		json_flush(js);
 	}
 	sbuf_free(&js->out);
+	for (size_t i = 0; i < js->task_cache_cnt; i++)
+		sbuf_free(&js->task_cache[i]);
+	free(js->task_cache);
 }
 
 static inline void json_str(struct json_state *js, const char *value)
