@@ -859,6 +859,10 @@ static inline void json_kv_bool(struct json_state *js, const char *key, bool val
 	do { json_key_literal(js, key); json_value_float(js, fmt, value); } while (0)
 #define json_kv_fmt_literal(js, key, ...) \
 	do { json_key_literal(js, key); json_fmt(js, __VA_ARGS__); } while (0)
+#define json_kv_uint_literal(js, key, value) \
+	do { json_key_literal(js, key); json_value_uint(js, value); } while (0)
+#define json_kv_null_literal(js, key) \
+	do { json_key_literal(js, key); json_literal(js, "null", 4); } while (0)
 #define json_subarr_start_literal(js, key) \
 	do { json_key_literal(js, key); json_arr_start(js); } while (0)
 #define json_subobj_start_literal(js, key) \
