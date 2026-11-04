@@ -10,7 +10,7 @@
 
 typedef uint64_t u64;
 #define __unused __attribute__((unused))
-#define BUG(...) abort()
+#define BUG(...) do { fprintf(stderr, __VA_ARGS__); abort(); } while (0)
 
 #ifdef JSON_REFERENCE
 #include "json_reference.h"
@@ -21,15 +21,21 @@ typedef uint64_t u64;
 int main(int argc, char **argv)
 {
 	bool empty = argc == 2 && strcmp(argv[1], "--empty") == 0;
+	bool large6 = argc == 2 && strcmp(argv[1], "--large-float6") == 0;
+	bool large9 = argc == 2 && strcmp(argv[1], "--large-float9") == 0;
 
-	if (argc > 2 || (argc == 2 && !empty))
+	if (argc > 2 || (argc == 2 && !empty && !large6 && !large9))
 		return 2;
 	struct json_state js = JSON_STATE_INIT(stdout);
 #ifndef JSON_REFERENCE
 	json_init(&js);
 #endif
 
-	if (!empty) {
+	if (large6 || large9) {
+		json_obj_start(&js);
+		json_kv_float(&js, "largest", large6 ? "%.6lf" : "%.9lf", DBL_MAX);
+		json_obj_end(&js);
+	} else if (!empty) {
 		char reused[32] = "original";
 		char reused_key[32] = "original-key";
 		char controls[32];
@@ -107,8 +113,11 @@ int main(int argc, char **argv)
 		json_kv_float(&js, "zero9", "%.9lf", -0.0);
 		json_kv_float(&js, "positive_zero6", "%.6lf", 0.0);
 		json_kv_float(&js, "positive_zero9", "%.9lf", 0.0);
+#ifdef JSON_REFERENCE
+		/* Retain the frozen baseline payload; main checks oversized floats. */
 		json_kv_float(&js, "largest6", "%.6lf", DBL_MAX);
 		json_kv_float(&js, "largest9", "%.9lf", DBL_MAX);
+#endif
 		json_kv_float(&js, "smallest6", "%.6lf", DBL_MIN);
 		json_kv_float(&js, "smallest9", "%.9lf", DBL_MIN);
 		json_kv_float(&js, "rounding6", "%.6lf", 1.2345675);

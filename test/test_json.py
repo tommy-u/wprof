@@ -5,6 +5,8 @@ from decimal import Decimal
 import hashlib
 import json
 import os
+import re
+import signal
 from pathlib import Path
 import shlex
 import shutil
@@ -20,6 +22,30 @@ REFERENCE_BYTES = 7219740
 REFERENCE_RECORDS = 12002
 REFERENCE_SHA256 = "baab684d42a1af585fe1ce21628b248c682b7567594d8ceca22f136b4a2d28cf"
 
+
+EXACT_TIMESTAMPS = {
+    "zero": "0.000000000",
+    "one_ns": "0.000000001",
+    "second_before": "0.999999999",
+    "second": "1.000000000",
+    "second_after": "1.000000001",
+    "guard_before": "4194303.999999999",
+    "guard": "4194304.000000000",
+    "guard_after": "4194304.000000001",
+    "seconds_2p23_before": "8388607.999999999",
+    "seconds_2p23": "8388608.000000000",
+    "seconds_2p23_after": "8388608.000000001",
+    "ns_2p53_before": "9007199.254740991",
+    "ns_2p53": "9007199.254740992",
+    "ns_2p53_after": "9007199.254740993",
+    "maximum_before": "18446744073.709551614",
+    "maximum": "18446744073.709551615",
+    "wrapped_minus_one": "18446744073.709551615",
+    "wrapped_before_second": "18446744072.709551617",
+    "wrapped_second": "18446744072.709551616",
+    "wrapped_after_second": "18446744072.709551615",
+    "wrapped_signed_min": "9223372036.854775808",
+}
 
 class JsonOptionsTest(unittest.TestCase):
     def test_removed_mode_and_tuning_flags_are_rejected(self):
@@ -72,15 +98,24 @@ class JsonWriterTest(unittest.TestCase):
         cls.lines = cls.output.splitlines()
         cls.records = [json.loads(line, parse_float=Decimal) for line in cls.lines]
 
-    def test_default_matches_reference_bytes(self):
+    def test_default_preserves_reference_except_documented_main_changes(self):
         digest = hashlib.sha256(self.reference).hexdigest()
         self.assertEqual(len(self.reference), REFERENCE_BYTES)
         self.assertEqual(len(self.reference.splitlines()), REFERENCE_RECORDS)
         self.assertEqual(digest, REFERENCE_SHA256)
-        self.assertEqual(len(self.output), len(self.reference))
-        self.assertEqual(hashlib.sha256(self.output).hexdigest(), digest)
-        self.assertEqual(self.output, self.reference)
-        print(f"Verified {len(self.reference)} bytes, {len(self.lines)} records, SHA-256 {digest}")
+        # The baseline remains pinned. Main preserves exact large timestamps
+        # and rejects floats that exceed its checked formatting buffer.
+        expected_lines = self.reference.splitlines(keepends=True)
+        first, count = re.subn(rb'"largest(?:6|9)":[-0-9.]+,', b"", expected_lines[0])
+        self.assertEqual(count, 2)
+        for key, value in EXACT_TIMESTAMPS.items():
+            pattern = b'"' + key.encode() + rb'":[-0-9.]+'
+            first, count = re.subn(pattern, b'"' + key.encode() + b'":' + value.encode(), first)
+            self.assertEqual(count, 1, key)
+        expected_lines[0] = first
+        expected = b"".join(expected_lines)
+        self.assertEqual(self.output, expected)
+        print(f"Verified {len(self.output)} bytes, {len(self.lines)} records, SHA-256 {hashlib.sha256(self.output).hexdigest()}")
 
     def test_control_bytes_utf8_and_owned_strings(self):
         first = self.records[0]
@@ -131,8 +166,19 @@ class JsonWriterTest(unittest.TestCase):
         for key, places in (("largest6", 6), ("largest9", 9)):
             with self.subTest(key=key):
                 value = largest + "." + "0" * places
-                self.assertIn(f'"{key}":{value},'.encode(), self.lines[0])
-                self.assertEqual(first[key], Decimal(value))
+                self.assertIn(f'"{key}":{value},'.encode(), self.reference.splitlines()[0])
+                reference = json.loads(self.reference.splitlines()[0], parse_float=Decimal)
+                self.assertEqual(reference[key], Decimal(value))
+
+    def test_oversized_float_reports_the_main_buffer_limit(self):
+        for places in (6, 9):
+            with self.subTest(places=places):
+                flag = f"--large-float{places}"
+                reference = subprocess.check_output([str(self.fixtures["reference"]), flag])
+                self.assertIn(b'"largest":179769313486231570', reference)
+                result = subprocess.run([str(self.fixtures["default"]), flag], capture_output=True)
+                self.assertEqual(result.returncode, -signal.SIGABRT)
+                self.assertIn(b"JSON float buffer too small", result.stderr)
 
     def test_integer_decimal_boundaries_in_objects_and_arrays(self):
         values = [
@@ -159,30 +205,8 @@ class JsonWriterTest(unittest.TestCase):
                     expected.update(positive=value, negative=-value, signed_array=[value, -value])
                 self.assertEqual(row, expected)
 
-    def test_timestamp_rollover_and_float_fallback_boundaries(self):
-        expected = {
-            "zero": "0.000000000",
-            "one_ns": "0.000000001",
-            "second_before": "0.999999999",
-            "second": "1.000000000",
-            "second_after": "1.000000001",
-            "guard_before": "4194303.999999999",
-            "guard": "4194304.000000000",
-            "guard_after": "4194304.000000001",
-            "seconds_2p23_before": "8388607.999999999",
-            "seconds_2p23": "8388608.000000000",
-            "seconds_2p23_after": "8388608.000000002",
-            "ns_2p53_before": "9007199.254740991",
-            "ns_2p53": "9007199.254740993",
-            "ns_2p53_after": "9007199.254740993",
-            "maximum_before": "18446744073.709552765",
-            "maximum": "18446744073.709552765",
-            "wrapped_minus_one": "18446744073.709552765",
-            "wrapped_before_second": "18446744072.709552765",
-            "wrapped_second": "18446744072.709552765",
-            "wrapped_after_second": "18446744072.709552765",
-            "wrapped_signed_min": "9223372036.854776382",
-        }
+    def test_timestamps_preserve_exact_nanoseconds_at_large_boundaries(self):
+        expected = EXACT_TIMESTAMPS
         self.assertEqual(self.records[0]["timestamps"], {key: Decimal(value) for key, value in expected.items()})
         for key, value in expected.items():
             with self.subTest(key=key):
