@@ -1483,3 +1483,19 @@ void ucfg_format(const struct utrace_cfg *cfg, struct sbuf *sb)
 	format_probe(cfg, sb);
 	format_settings(&cfg->settings, sb);
 }
+
+int ucfg_validate_seals(int first_cfg)
+{
+	if (!(env.seals & SEAL_UPROBE_ARGS))
+		return 0;
+	for (int i = first_cfg; i < env.utrace_cfg_cnt; i++) {
+		if (!ucfg_has_uprobe_args(&env.utrace_cfgs[i]))
+			continue;
+		struct sbuf sb = sbuf_new();
+		ucfg_format(&env.utrace_cfgs[i], &sb);
+		eprintf("Uprobe argument capture is disabled by --seal uprobe-args: '%s'\n", sbuf_str(&sb));
+		sbuf_free(&sb);
+		return -EINVAL;
+	}
+	return 0;
+}

@@ -1584,6 +1584,7 @@ static int attach_bpf(struct bpf_state *st, struct worker_state *workers, int nu
 
 	if (env.utrace_cfg_cnt > 0) {
 		err = utrace_attach(st, st->skel);
+		utrace_close_mapped_files();
 		if (err) {
 			eprintf("Failed to attach utrace probes: %d\n", err);
 			return err;
@@ -3102,6 +3103,7 @@ skip_data_collection:
 	print_stats(env.stats, err);
 
 cleanup:
+	utrace_close_mapped_files();
 	/*
 	 * Idempotent teardown, ordered for the error paths that jump here with
 	 * ringbuf workers still running and `fr`/chunks still live (e.g. a
@@ -3122,6 +3124,7 @@ cleanup:
 		injmgr_teardown();
 	cleanup_workers(workers, worker_cnt);
 	cleanup_bpf(&bpf_state);
+	utrace_cleanup_mapped_files();
 	if (workdir_fd >= 0)
 		close(workdir_fd);
 	if (!env.keep_workdir && workdir_name[0])

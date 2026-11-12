@@ -1013,19 +1013,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		}
 		if (err)
 			return err;
-		if (!(env.seals & SEAL_UPROBE_ARGS))
-			break;
-		for (int i = first_cfg; i < env.utrace_cfg_cnt; i++) {
-			if (!ucfg_has_uprobe_args(&env.utrace_cfgs[i]))
-				continue;
-
-			struct sbuf sb = sbuf_new();
-			ucfg_format(&env.utrace_cfgs[i], &sb);
-			fprintf(stderr, "Uprobe argument capture is disabled by --seal uprobe-args: '%s'\n",
-				sbuf_str(&sb));
-			sbuf_free(&sb);
-			return -EINVAL;
-		}
+		err = ucfg_validate_seals(first_cfg);
+		if (err)
+			return err;
 		break;
 	}
 	/* METADATA */

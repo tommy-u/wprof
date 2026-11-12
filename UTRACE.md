@@ -609,3 +609,4 @@ available:
 
 Use `arg:*` to capture all detected arguments with their inferred types
 and names.
+

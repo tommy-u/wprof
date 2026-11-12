@@ -274,6 +274,7 @@ struct utrace_cfg {
 			char *name;
 			long off;
 			const char *attach_path;	/* resolved path used to attach (/proc/<pid>/map_files/... or user path) */
+			int mapped_fd; /* 0: ordinary path; >0: shared descriptor; -1: closed */
 			const char *display_path;	/* human-readable path for logging/output */
 			unsigned long attach_off;	/* resolved total offset: sym_offset + off */
 		} uprobe;
@@ -423,6 +424,7 @@ int utrace_compile_tmpl(const char *tmpl, const struct utrace_param *params, int
 int ucfg_compile_tmpls(struct utrace_cfg *cfg);
 void ucfg_ensure_pid(struct utrace_cfg *cfg, int pid);
 int ucfg_parse(const char *def);
+int ucfg_validate_seals(int first_cfg);
 int ucfg_parse_file(const char *path);
 void ucfg_format(const struct utrace_cfg *cfg, struct sbuf *sb);
 bool ucfg_has_uprobe_args(const struct utrace_cfg *cfg);

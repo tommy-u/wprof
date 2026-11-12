@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <elf.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <bpf/btf.h>
 
@@ -1808,6 +1811,156 @@ static int resolve_uprobe_binary(int pid, const char *sym_name,
 	return -ENOENT;
 }
 
+/* Open the mapped object once, so symbol lookup and attachment cannot follow a later remap. */
+int utrace_open_mapped_binary(int pid, const char *library, char **display_path)
+{
+	struct vma_iter it;
+	int err = vma_iter_new(&it, pid, VMA_QUERY_FILE_BACKED_VMA | VMA_QUERY_VMA_EXECUTABLE);
+	if (err)
+		return err;
+	int fd = -ENOENT;
+	u64 inode = 0;
+	u32 major = 0, minor = 0;
+	struct vma_info *vma;
+	while ((vma = vma_iter_next(&it))) {
+		const char *name = vma->vma_name, *base = strrchr(name, '/');
+		if (!base || strncmp(base + 1, library, strlen(library)) ||
+		    !strchr(". ", base[1 + strlen(library)]))
+			continue;
+		if (fd >= 0) {
+			if (inode == vma->inode && major == vma->dev_major && minor == vma->dev_minor)
+				continue;
+			err = -EEXIST;
+			break;
+		}
+		char map_file[128];
+		snprintf(map_file, sizeof(map_file), "/proc/%d/map_files/%llx-%llx", pid, vma->vma_start, vma->vma_end);
+		fd = open(map_file, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) {
+			err = -errno;
+			break;
+		}
+		Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+		GElf_Ehdr hdr;
+		bool native = elf && gelf_getehdr(elf, &hdr) && gelf_getclass(elf) == ELFCLASS64 &&
+			      hdr.e_ident[EI_DATA] == ELFDATA2LSB && hdr.e_machine == EM_X86_64;
+		elf_end(elf);
+		if (!native) {
+			err = -EOPNOTSUPP;
+			break;
+		}
+		*display_path = str_has_suffix(name, " (deleted)") ? strndup(name, strlen(name) - 10) : strdup(name);
+		if (!*display_path) {
+			err = -ENOMEM;
+			break;
+		}
+		/* UTRACE's ordinary path parameter cannot encode these delimiters. */
+		if (strpbrk(*display_path, ",|") || strstr(*display_path, "~~")) {
+			err = -EILSEQ;
+			break;
+		}
+		inode = vma->inode;
+		major = vma->dev_major;
+		minor = vma->dev_minor;
+	}
+	vma_iter_destroy(&it);
+	if (err) {
+		if (fd >= 0)
+			close(fd);
+		free(*display_path);
+		*display_path = NULL;
+		return err;
+	}
+	return fd;
+}
+
+static struct mapped_uprobe_file {
+	dev_t device;
+	ino_t inode;
+	int fd;
+} *mapped_files;
+static int mapped_file_cnt;
+
+int utrace_bind_mapped_uprobe_offset(struct utrace_cfg *cfg, int fd, unsigned long offset)
+{
+	struct stat identity;
+	if (fstat(fd, &identity))
+		return -errno;
+	int owned = -1;
+	for (int i = 0; i < mapped_file_cnt; i++) {
+		if (mapped_files[i].fd >= 0 && mapped_files[i].device == identity.st_dev && mapped_files[i].inode == identity.st_ino) {
+			owned = mapped_files[i].fd;
+			break;
+		}
+	}
+	if (owned < 0) {
+		struct mapped_uprobe_file *tmp = realloc(mapped_files, (mapped_file_cnt + 1) * sizeof(*mapped_files));
+		if (!tmp)
+			return -ENOMEM;
+		mapped_files = tmp;
+		owned = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+		if (owned < 0)
+			return -errno;
+		mapped_files[mapped_file_cnt] = (struct mapped_uprobe_file){identity.st_dev, identity.st_ino, owned};
+		mapped_file_cnt++;
+	}
+	char fd_path[64];
+	snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", owned);
+	char *path = strdup(fd_path);
+	if (!path)
+		return -ENOMEM;
+	cfg->uprobe.attach_path = path;
+	cfg->uprobe.display_path = cfg_binary_path(cfg);
+	cfg->uprobe.attach_off = offset;
+	cfg->uprobe.mapped_fd = owned;
+	return 0;
+}
+
+int utrace_bind_mapped_uprobe(struct utrace_cfg *cfg, int fd)
+{
+	const char *name = cfg->uprobe.name;
+	unsigned long offset;
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	int err = elf_find_syms(path, STT_FUNC, &name, 1, &offset);
+	return err ?: utrace_bind_mapped_uprobe_offset(cfg, fd, offset);
+}
+
+void utrace_close_mapped_files(void)
+{
+	for (int i = 0; i < mapped_file_cnt; i++) {
+		if (mapped_files[i].fd >= 0) {
+			close(mapped_files[i].fd);
+			mapped_files[i].fd = -1;
+		}
+	}
+	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
+		utrace_for_each_leg(cfg, &env.utrace_cfgs[i]) {
+			if (cfg->type != UTRACE_UPROBE && cfg->type != UTRACE_URETPROBE && cfg->type != UTRACE_UPROBE_SPAN)
+				continue;
+			if (cfg->uprobe.mapped_fd > 0)
+				cfg->uprobe.mapped_fd = -1;
+		}
+	}
+}
+
+void utrace_cleanup_mapped_files(void)
+{
+	utrace_close_mapped_files();
+	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
+		utrace_for_each_leg(cfg, &env.utrace_cfgs[i]) {
+			if ((cfg->type == UTRACE_UPROBE || cfg->type == UTRACE_URETPROBE || cfg->type == UTRACE_UPROBE_SPAN) && cfg->uprobe.mapped_fd) {
+				free((void *)cfg->uprobe.attach_path);
+				cfg->uprobe.attach_path = NULL;
+				cfg->uprobe.mapped_fd = 0;
+			}
+		}
+	}
+	free(mapped_files);
+	mapped_files = NULL;
+	mapped_file_cnt = 0;
+}
+
 /*
  * Resolve a uprobe cfg's attach target: either use its explicit path: to find
  * the symbol, or discover the binary via the process's /proc/<pid>/maps. Fills
@@ -1816,6 +1969,8 @@ static int resolve_uprobe_binary(int pid, const char *sym_name,
  */
 static int resolve_uprobe_cfg(struct utrace_cfg *cfg, bool mandatory)
 {
+	if (cfg->uprobe.mapped_fd > 0)
+		return 0;
 	int lvl = mandatory ? -1 : 1;
 	const char *binary_path = cfg_binary_path(cfg);
 	int pid = cfg_pid(cfg);
