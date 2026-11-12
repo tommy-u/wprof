@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #include <bpf/btf.h>
 
@@ -24,6 +25,13 @@
 #include "proc.h"
 #include "wprof_query.h"
 #include "wprof.skel.h"
+
+static bool use_uprobe_multi;
+
+static bool cfg_uprobe_multi(const struct utrace_cfg *cfg)
+{
+	return use_uprobe_multi && cfg->type == UTRACE_UPROBE_SPAN && cfg->uprobe.mapped_fd > 0;
+}
 
 static enum utrace_arg_type usdt_arg_to_utrace_type(const struct usdt_arg_info *arg)
 {
@@ -2522,6 +2530,7 @@ int utrace_setup(struct wprof_bpf *skel)
 	}
 
 	env.capture_utrace = TRUE;
+	use_uprobe_multi = false;
 
 	if (!(env.requested_stack_traces & ST_UTRACE)) {
 		for (int i = 0; i < env.utrace_cfg_cnt; i++) {
@@ -2562,6 +2571,10 @@ int utrace_setup(struct wprof_bpf *skel)
 					bpf_program__set_autoload(skel->progs.wprof_ut_uprobe, true);
 				if (cfg_needs_uretprobe(leg))
 					bpf_program__set_autoload(skel->progs.wprof_ut_uret, true);
+				if (leg->type == UTRACE_UPROBE_SPAN && leg->uprobe.mapped_fd > 0) {
+					bpf_program__set_autoload(skel->progs.wprof_ut_uprobe_multi, true);
+					bpf_program__set_autoload(skel->progs.wprof_ut_uret_multi, true);
+				}
 				err = resolve_uprobe_cfg(leg, mandatory);
 				break;
 			case UTRACE_KPROBE:
@@ -2756,6 +2769,42 @@ int utrace_setup(struct wprof_bpf *skel)
 	return 0;
 }
 
+void utrace_prepare_load(struct wprof_bpf *skel)
+{
+	if (!bpf_program__autoload(skel->progs.wprof_ut_uprobe_multi))
+		return;
+	struct bpf_program *templates[] = {skel->progs.wprof_ut_uprobe_multi, skel->progs.wprof_ut_uret_multi};
+	int error = 0;
+	libbpf_print_fn_t print = libbpf_set_print(NULL);
+	/* Probe the actual prepared bodies: a type name does not establish sleepable/helper support. */
+	for (int i = 0; i < ARRAY_SIZE(templates); i++) {
+		int fd = bpf_program__clone(templates[i], NULL);
+		if (fd < 0) {
+			error = fd;
+			break;
+		}
+		close(fd);
+	}
+	libbpf_set_print(print);
+	use_uprobe_multi = !error;
+	if (error) {
+		for (int i = 0; i < ARRAY_SIZE(templates); i++)
+			bpf_program__set_autoload(templates[i], false);
+		vprintf("utrace: sleepable multi-uprobe load unsupported (%s); using individual uprobes\n", errstr(error));
+	}
+}
+
+static void raise_utrace_fd_limit(void)
+{
+	struct rlimit limit;
+	if (getrlimit(RLIMIT_NOFILE, &limit) || limit.rlim_cur == limit.rlim_max)
+		return;
+	limit.rlim_cur = limit.rlim_max;
+	if (setrlimit(RLIMIT_NOFILE, &limit))
+		wprintf("utrace: failed to raise descriptor limit to %llu: %s; trying individual attachment\n",
+			(unsigned long long)limit.rlim_max, errstr(-errno));
+}
+
 /*
  * Attach one probe instance for the given cfg (which may be a simple type or a
  * native span). Callers of native spans (UPROBE_SPAN/KPROBE_SPAN/BPF_SPAN) invoke
@@ -2936,14 +2985,103 @@ static int attach_utrace_probe(struct bpf_state *st, struct wprof_bpf *skel,
 	return 0;
 }
 
-int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
+static int attach_mapped_spans(struct bpf_state *st, struct wprof_bpf *skel, int first,
+			       bool *attached, int map_fd, u32 *map_idx, bool *multi)
 {
+	struct utrace_cfg *base = &env.utrace_cfgs[first];
+	unsigned long offsets[env.utrace_cfg_cnt];
+	u64 entry_cookies[env.utrace_cfg_cnt], exit_cookies[env.utrace_cfg_cnt];
+	int indices[env.utrace_cfg_cnt];
+	size_t count = 0;
+	u32 first_cookie = *map_idx;
+	for (int i = first; i < env.utrace_cfg_cnt; i++) {
+		struct utrace_cfg *cfg = &env.utrace_cfgs[i];
+		if (attached[i] || !cfg_uprobe_multi(cfg) || cfg_pid(cfg) != cfg_pid(base) ||
+		    cfg->uprobe.mapped_fd != base->uprobe.mapped_fd)
+			continue;
+		struct utrace_probe_cfg pcfg;
+		fill_probe_cfg(&pcfg, cfg, i, UTRACE_ENTRY, false);
+		if (bpf_map_update_elem(map_fd, map_idx, &pcfg, BPF_ANY))
+			return -errno;
+		entry_cookies[count] = *map_idx;
+		*map_idx += 1;
+		fill_probe_cfg(&pcfg, cfg, i, UTRACE_EXIT, true);
+		if (bpf_map_update_elem(map_fd, map_idx, &pcfg, BPF_ANY))
+			return -errno;
+		exit_cookies[count] = *map_idx;
+		*map_idx += 1;
+		offsets[count] = cfg->uprobe.attach_off;
+		indices[count] = i;
+		count++;
+	}
+	struct bpf_link *links[2] = {};
+	int error = 0;
+	for (int exit = 0; exit < 2; exit++) {
+		LIBBPF_OPTS(bpf_uprobe_multi_opts, opts, .offsets = offsets, .cnt = count,
+			    .cookies = exit ? exit_cookies : entry_cookies, .retprobe = exit);
+		struct bpf_program *prog = exit ? skel->progs.wprof_ut_uret_multi : skel->progs.wprof_ut_uprobe_multi;
+		links[exit] = bpf_program__attach_uprobe_multi(prog, cfg_pid(base), base->uprobe.attach_path, NULL, &opts);
+		if (!links[exit]) {
+			error = -errno;
+			break;
+		}
+	}
+	if (error) {
+		/* Entry attachment can succeed before return attachment fails; never leave it active on retry. */
+		for (int i = 0; i < ARRAY_SIZE(links); i++)
+			bpf_link__destroy(links[i]);
+		vprintf("utrace: multi-uprobe attach in %s failed (%s); using individual uprobes\n",
+			base->uprobe.display_path, errstr(error));
+		raise_utrace_fd_limit();
+		*map_idx = first_cookie;
+		for (size_t i = 0; i < count; i++) {
+			struct utrace_cfg *cfg = &env.utrace_cfgs[indices[i]];
+			int err = attach_utrace_probe(st, skel, cfg, indices[i], UTRACE_ENTRY, false, false, map_fd, map_idx);
+			if (!err)
+				err = attach_utrace_probe(st, skel, cfg, indices[i], UTRACE_EXIT, true, true, map_fd, map_idx);
+			if (err)
+				return err;
+		}
+	} else {
+		for (int i = 0; i < ARRAY_SIZE(links); i++) {
+			int err = add_link(st, links[i]);
+			if (err) {
+				for (int j = i; j < ARRAY_SIZE(links); j++)
+					bpf_link__destroy(links[j]);
+				return err;
+			}
+		}
+	}
+	for (size_t i = 0; i < count; i++)
+		attached[indices[i]] = true;
+	*multi = !error;
+	return 0;
+}
+
+int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel, enum utrace_mapped_attach_mode *mode)
+{
+	*mode = UTRACE_MAPPED_NONE;
+
 	int err;
 	int map_fd = bpf_map__fd(skel->maps.utrace_probe_cfgs);
+	bool attached[env.utrace_cfg_cnt];
+	memset(attached, 0, sizeof(attached));
+	bool did_multi = false, did_individual = false, limit_raised = false;
 	u32 map_idx = 0;
 
 	for (int i = 0; i < env.utrace_cfg_cnt; i++) {
 		struct utrace_cfg *cfg = &env.utrace_cfgs[i];
+		if (attached[i])
+			continue;
+		if (cfg_uprobe_multi(cfg)) {
+			bool multi;
+			err = attach_mapped_spans(st, skel, i, attached, map_fd, &map_idx, &multi);
+			if (err)
+				return err;
+			did_multi |= multi;
+			did_individual |= !multi;
+			continue;
+		}
 
 		switch (cfg->type) {
 		case UTRACE_UPROBE:
@@ -2963,6 +3101,11 @@ int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
 		case UTRACE_UPROBE_SPAN:
 		case UTRACE_KPROBE_SPAN:
 		case UTRACE_BPF_SPAN:
+			if (cfg->type == UTRACE_UPROBE_SPAN && cfg->uprobe.mapped_fd > 0 && !limit_raised) {
+				raise_utrace_fd_limit();
+				limit_raised = true;
+			}
+			did_individual |= cfg->type == UTRACE_UPROBE_SPAN && cfg->uprobe.mapped_fd > 0;
 			err = attach_utrace_probe(st, skel, cfg, i, UTRACE_ENTRY, false,
 						  false, map_fd, &map_idx);
 			if (err)
@@ -2992,5 +3135,9 @@ int utrace_attach(struct bpf_state *st, struct wprof_bpf *skel)
 		}
 	}
 
+	if (did_multi)
+		*mode = did_individual ? UTRACE_MAPPED_MIXED : UTRACE_MAPPED_MULTI;
+	else if (did_individual)
+		*mode = UTRACE_MAPPED_INDIVIDUAL;
 	return 0;
 }

@@ -341,6 +341,26 @@ silently recording nothing. Examples:
 Discovery runs once at startup, so processes that start later are not
 picked up.
 
+#### Attachment and descriptor limits
+
+Live captures require root privileges. Replaying a readable capture does not require root.
+
+Same-function `uspan:` probes bound to mapped files can use uprobe-multi:
+one entry link and one return link per PID/library, with a separate cookie
+for each site's ordinary UTRACE configuration. The prepared entry and return
+program templates are loaded to check support before the main program load;
+unsupported templates use individual uprobes. If either multi link cannot
+attach, any link already created for that group is removed before retrying
+the group with individual probes. Ordinary manually specified probes keep their individual attachments.
+
+Mapped file descriptors are shared by file identity and closed after
+attachment or on failure. Individual fallback can need perf-event and link
+descriptors for each leg. On that path wprof raises the soft descriptor limit
+to the existing hard limit, with no up-front reservation. A failed increase
+is reported and attachment proceeds with the available descriptors.
+The multi path needs only two links per PID/library; its descriptor use
+does not grow by two links per catalog name.
+
 ## Settings
 
 Settings go inside `| ... |` after the parameters, comma-separated.

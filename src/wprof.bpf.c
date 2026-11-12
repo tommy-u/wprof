@@ -2504,6 +2504,18 @@ int wprof_ut_uret(struct pt_regs *ctx)
 	return utrace_handle_probe(ctx, 0);
 }
 
+SEC("?uprobe.multi.s")
+int wprof_ut_uprobe_multi(struct pt_regs *ctx)
+{
+	return utrace_handle_probe(ctx, 0);
+}
+
+SEC("?uretprobe.multi.s")
+int wprof_ut_uret_multi(struct pt_regs *ctx)
+{
+	return utrace_handle_probe(ctx, 0);
+}
+
 SEC("?usdt.s")
 int wprof_ut_usdt(struct pt_regs *ctx)
 {

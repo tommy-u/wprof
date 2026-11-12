@@ -1371,6 +1371,8 @@ static int setup_bpf(struct bpf_state *st, struct worker_state *workers, int num
 	bpf_program__set_autoload(skel->progs.wprof_ut_bpf_entry, false);
 	bpf_program__set_autoload(skel->progs.wprof_ut_bpf_exit, false);
 
+	utrace_prepare_load(skel);
+
 	err = wprof_bpf__load(skel);
 	if (err) {
 		eprintf("Failed to load BPF skeleton: %d\n", err);
@@ -1583,7 +1585,8 @@ static int attach_bpf(struct bpf_state *st, struct worker_state *workers, int nu
 	}
 
 	if (env.utrace_cfg_cnt > 0) {
-		err = utrace_attach(st, st->skel);
+		enum utrace_mapped_attach_mode mode;
+		err = utrace_attach(st, st->skel, &mode);
 		utrace_close_mapped_files();
 		if (err) {
 			eprintf("Failed to attach utrace probes: %d\n", err);
