@@ -670,6 +670,16 @@ portion may still be available through mapped `libcuda.so`. Use
 `nvcc --cudart shared` when runtime API tracing is needed. Generic manual UTRACE
 probes may target symbols in an executable with `path:`.
 
+When shared `libcudart.so` is mapped, generated driver probes skip calls whose
+x86-64 entry return address lies in that runtime's executable mapping. Runtime
+spans and direct application calls into the driver remain available. This
+uses the same check in entry and return programs for multi and individual
+uprobes. This checks the immediate caller; it does not infer a runtime caller through other
+libraries or application wrappers. A statically linked runtime has no shared
+runtime mapping to filter, so its driver calls are retained. Manually specified
+UTRACE probes retain their normal behavior. The per-PID metadata
+`cuda-api.nested_driver.PID=skipped` or `retained` records the configured policy.
+
 The preset creates `uspan` definitions on the `CUDA host API` thread track
 for native x86-64 targets using the UTRACE attachment described above.
 

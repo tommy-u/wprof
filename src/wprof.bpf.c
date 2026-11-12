@@ -2358,6 +2358,23 @@ static int utrace_read_str(u64 cur, enum utrace_handler_flags flags,
 		return bpf_copy_from_user_str(buf, size, (void *)(cur + op->offset), 0);
 }
 
+static __always_inline bool utrace_skip_caller(struct pt_regs *ctx, const struct utrace_probe_cfg *cfg)
+{
+	u64 caller;
+
+	if (!cfg->skip_caller_start)
+		return false;
+
+	if (cfg->event_type == UTRACE_ENTRY) {
+		if (bpf_copy_from_user(&caller, sizeof(caller), (void *)PT_REGS_SP_CORE(ctx)))
+			return false;
+	} else {
+		caller = PT_REGS_IP_CORE(ctx);
+	}
+
+	return caller >= cfg->skip_caller_start && caller < cfg->skip_caller_end;
+}
+
 static __always_inline int utrace_handle_probe(void *ctx, enum utrace_handler_flags flags)
 {
 	u64 now_ts = bpf_ktime_get_ns();
@@ -2369,6 +2386,9 @@ static __always_inline int utrace_handle_probe(void *ctx, enum utrace_handler_fl
 	u32 cookie = (flags & UTRACE_PF_USDT) ? bpf_usdt_cookie(ctx) : bpf_get_attach_cookie(ctx);
 	struct utrace_probe_cfg *cfg = bpf_map_lookup_elem(&utrace_probe_cfgs, &cookie);
 	if (!cfg)
+		return 0;
+
+	if (!(flags & (UTRACE_PF_KERNEL | UTRACE_PF_USDT)) && utrace_skip_caller(ctx, cfg))
 		return 0;
 
 	u64 arg_cnt = cfg->arg_cnt;

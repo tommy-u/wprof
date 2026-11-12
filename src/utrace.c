@@ -122,6 +122,8 @@ static void fill_probe_cfg(struct utrace_probe_cfg *pcfg, const struct utrace_cf
 	pcfg->utrace_id = utrace_id;
 	pcfg->event_type = event_type;
 	pcfg->probe_type = cfg->type;
+	pcfg->skip_caller_start = cfg->skip_caller_start;
+	pcfg->skip_caller_end = cfg->skip_caller_end;
 
 	int arg_idx = 0;
 	for (int i = 0; i < cfg->param_cnt && arg_idx < MAX_UTRACE_ARGS; i++) {
@@ -1820,8 +1822,11 @@ static int resolve_uprobe_binary(int pid, const char *sym_name,
 }
 
 /* Open the mapped object once, so symbol lookup and attachment cannot follow a later remap. */
-int utrace_open_mapped_binary(int pid, const char *library, char **display_path)
+int utrace_open_mapped_binary(int pid, const char *library, char **display_path,
+			      struct utrace_mapped_range *exec_range)
 {
+	struct utrace_mapped_range range = {};
+	bool separate_ranges = false;
 	struct vma_iter it;
 	int err = vma_iter_new(&it, pid, VMA_QUERY_FILE_BACKED_VMA | VMA_QUERY_VMA_EXECUTABLE);
 	if (err)
@@ -1836,8 +1841,13 @@ int utrace_open_mapped_binary(int pid, const char *library, char **display_path)
 		    !strchr(". ", base[1 + strlen(library)]))
 			continue;
 		if (fd >= 0) {
-			if (inode == vma->inode && major == vma->dev_major && minor == vma->dev_minor)
+			if (inode == vma->inode && major == vma->dev_major && minor == vma->dev_minor) {
+				/* A single interval must not include executable mappings belonging to other objects. */
+				separate_ranges |= vma->vma_start > range.end || vma->vma_end < range.start;
+				range.start = min(range.start, (unsigned long)vma->vma_start);
+				range.end = max(range.end, (unsigned long)vma->vma_end);
 				continue;
+			}
 			err = -EEXIST;
 			break;
 		}
@@ -1870,6 +1880,7 @@ int utrace_open_mapped_binary(int pid, const char *library, char **display_path)
 		inode = vma->inode;
 		major = vma->dev_major;
 		minor = vma->dev_minor;
+		range = (struct utrace_mapped_range){vma->vma_start, vma->vma_end};
 	}
 	vma_iter_destroy(&it);
 	if (err) {
@@ -1879,6 +1890,8 @@ int utrace_open_mapped_binary(int pid, const char *library, char **display_path)
 		*display_path = NULL;
 		return err;
 	}
+	if (exec_range)
+		*exec_range = separate_ranges ? (struct utrace_mapped_range){} : range;
 	return fd;
 }
 

@@ -267,6 +267,7 @@ struct utrace_cfg {
 	int param_cnt;
 
 	struct utrace_settings settings;
+	u64 skip_caller_start, skip_caller_end;
 
 	union {
 		/* UPROBE, URETPROBE, UPROBE_SPAN */

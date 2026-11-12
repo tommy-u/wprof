@@ -345,6 +345,7 @@ struct utrace_probe_cfg {
 	u32 flags;				/* enum utrace_probe_flags */
 	enum utrace_event_type event_type;
 	enum utrace_type probe_type;
+	u64 skip_caller_start, skip_caller_end;
 	u8 arg_op_cnt[MAX_UTRACE_ARGS];
 	struct utrace_read_op arg_ops[MAX_UTRACE_ARGS][MAX_UTRACE_READ_OPS];
 };

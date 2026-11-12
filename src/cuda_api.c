@@ -9,7 +9,7 @@
 static const struct cuda_api_site sites[] = {
 #include "cuda_api_sites.h"
 };
-static const char *libraries[] = {"libcuda.so", "libcudart.so"};
+static const char *libraries[] = {"libcudart.so", "libcuda.so"};
 
 static int outcome(int pid, const char *status, int err)
 {
@@ -19,10 +19,13 @@ static int outcome(int pid, const char *status, int err)
 
 static int prepare_target(int pid)
 {
+	struct utrace_mapped_range runtime_range = {};
+	bool skip_nested_driver = false;
 	int err = 0, count = 0;
 	for (int i = 0; i < ARRAY_SIZE(libraries); i++) {
 		char *path = NULL;
-		int fd = utrace_open_mapped_binary(pid, libraries[i], &path);
+		struct utrace_mapped_range exec_range = {};
+		int fd = utrace_open_mapped_binary(pid, libraries[i], &path, &exec_range);
 		if (fd < 0) {
 			wprintf("cuda-api: PID %d %s: unavailable_or_ambiguous (%d)\n", pid, libraries[i], fd);
 			err = append_str(&env.metadata, &env.metadata_cnt,
@@ -31,6 +34,8 @@ static int prepare_target(int pid)
 				return err;
 			continue;
 		}
+		if (!strcmp(libraries[i], "libcudart.so"))
+			runtime_range = exec_range;
 		struct sbuf def = sbuf_new();
 		char fd_path[64];
 		const char *names[ARRAY_SIZE(sites)];
@@ -77,6 +82,11 @@ static int prepare_target(int pid)
 				err = utrace_bind_mapped_uprobe_offset(&env.utrace_cfgs[first], fd, resolved[j].offset);
 			if (err)
 				break;
+			if (runtime_range.end && !strcmp(site->library, "libcuda.so")) {
+				env.utrace_cfgs[first].skip_caller_start = runtime_range.start;
+				env.utrace_cfgs[first].skip_caller_end = runtime_range.end;
+				skip_nested_driver = true;
+			}
 			count++;
 			vprintf("cuda-api: PID %d site %s prepared (%s)\n", pid, site->name, path);
 		}
@@ -93,6 +103,10 @@ static int prepare_target(int pid)
 		if (shared_address)
 			wprintf("cuda-api: PID %d %s: one call may appear under several names\n", pid, libraries[i]);
 	}
+	err = append_str(&env.metadata, &env.metadata_cnt,
+			 sfmt("cuda-api.nested_driver.%d=%s", pid, skip_nested_driver ? "skipped" : "retained"));
+	if (err)
+		return err;
 	return outcome(pid, count ? "span_prepared" : "no_available_sites", 0);
 }
 
