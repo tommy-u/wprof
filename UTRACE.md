@@ -343,7 +343,8 @@ picked up.
 
 #### Attachment and descriptor limits
 
-Live captures require root privileges. Replaying a readable capture does not require root.
+Live captures require root privileges; the test runners invoke wprof with
+`sudo -n`. Replaying a readable capture does not require root.
 
 Same-function `uspan:` probes bound to mapped files can use uprobe-multi:
 one entry link and one return link per PID/library, with a separate cookie
@@ -361,6 +362,9 @@ to the existing hard limit, with no up-front reservation. A failed increase
 is reported and attachment proceeds with the available descriptors.
 The multi path needs only two links per PID/library; its descriptor use
 does not grow by two links per catalog name.
+
+Worker-thread filtering with uprobe-multi was tested on Linux 6.16.1;
+the same filtering on older kernels has not been verified.
 
 ## Settings
 
@@ -696,6 +700,8 @@ Ordinary user-written UTRACE definitions keep their existing behavior.
 Library resolution time
 and the UTRACE attachment interval are recorded in `cuda-api.*` metadata.
 
+See `test/README.md` for CPU fixtures, real CUDA verification, the optional
+externally supplied API-coverage workload and prior A100 measurements.
 The full catalog is not an execution coverage list: missing exports and
 untested operations remain distinct. SDK wrappers and application-side helpers
 can forward to different exported APIs; the trace reports the exports observed.
