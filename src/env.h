@@ -270,6 +270,12 @@ struct env {
 	int cuda_pid_cnt;
 	enum cuda_discover_strategy cuda_discovery;
 
+	/* CUDA host API preset; expanded into ordinary UTRACE definitions */
+	bool cuda_api_enabled;
+	int *cuda_api_pids;
+	int cuda_api_pid_cnt;
+	bool cuda_api_disabled;
+
 	/* EXPERIMENTAL (Python stacks) */
 	int *pystacks_pids;
 	int pystacks_pid_cnt;

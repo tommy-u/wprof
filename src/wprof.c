@@ -40,6 +40,7 @@
 #include "wprof.skel.h"
 
 #include "env.h"
+#include "cuda_api.h"
 #include "flightrec.h"
 #include "wprof_build_info.h"
 #include "protobuf.h"
@@ -1342,6 +1343,11 @@ static int setup_bpf(struct bpf_state *st, struct worker_state *workers, int num
 
 	skel->rodata->fr_enabled = env.flightrec;
 
+	err = cuda_api_setup();
+	if (err) {
+		eprintf("Failed to prepare CUDA host API preset: %d\n", err);
+		return err;
+	}
 	err = utrace_setup(skel);
 	if (err) {
 		eprintf("Failed to setup utrace: %d\n", err);
@@ -1585,8 +1591,11 @@ static int attach_bpf(struct bpf_state *st, struct worker_state *workers, int nu
 	}
 
 	if (env.utrace_cfg_cnt > 0) {
+		u64 attach_begin = ktime_now_ns();
 		enum utrace_mapped_attach_mode mode;
 		err = utrace_attach(st, st->skel, &mode);
+		if (!err)
+			err = cuda_api_record_attachment(mode, ktime_now_ns() - attach_begin);
 		utrace_close_mapped_files();
 		if (err) {
 			eprintf("Failed to attach utrace probes: %d\n", err);
@@ -1903,6 +1912,38 @@ static int do_activate(struct bpf_state *bpf)
 	return 0;
 }
 
+static int print_cuda_replay_summary(struct wprof_data_hdr *hdr)
+{
+	struct summary { int pid, spans; } *summaries = NULL;
+	int count = 0;
+	for (u64 i = 0; i < hdr->extra_cnt; i++) {
+		struct wprof_extra_param *extra = wevent_extra_param(hdr, i);
+		if (extra->kind != WEXTRA_UTRACE_DEF)
+			continue;
+		int pid = cuda_api_definition_pid(wevent_str(hdr, extra->stroff));
+		if (pid < 0)
+			continue;
+		int index = 0;
+		while (index < count && summaries[index].pid != pid)
+			index++;
+		if (index == count) {
+			struct summary *tmp = realloc(summaries, (count + 1) * sizeof(*summaries));
+			if (!tmp) {
+				free(summaries);
+				return -ENOMEM;
+			}
+			summaries = tmp;
+			summaries[count] = (struct summary){.pid = pid};
+			count++;
+		}
+		summaries[index].spans++;
+	}
+	for (int i = 0; i < count; i++)
+		wprintf("    CUDA host API: PID %d, %d span definitions (details: -v)\n", summaries[i].pid, summaries[i].spans);
+	free(summaries);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct bpf_state bpf_state = {};
@@ -2173,19 +2214,28 @@ int main(int argc, char **argv)
 					wprintf("    %-*s%u x %uMB\n", w - 4, "Ringbufs:", env.stats->rb_cnt, env.stats->ringbuf_sz / 1024 / 1024);
 					wprintf("    %-*s%u\n", w - 4, "Tasks capacity:", env.stats->task_state_sz);
 				}
+				bool has_cuda_metadata = false;
 				if (has_metadata) {
+					unsigned int site_details = 0;
 					wprintf("%-*s\n", w, "Metadata:");
 					for (u64 i = 0; i < dump_hdr->extra_cnt; i++) {
 						struct wprof_extra_param *e = wevent_extra_param(dump_hdr, i);
 						if (e->kind != WEXTRA_METADATA)
 							continue;
 						const char *kv = wevent_str(dump_hdr, e->stroff);
+						has_cuda_metadata |= !strncmp(kv, "cuda-api.", 9);
+						if (!env_verbose && !strncmp(kv, "cuda-api.site.", 14)) {
+							site_details++;
+							continue;
+						}
 						const char *eq = strchr(kv, '=');
 						if (eq)
 							wprintf("    %.*s = %s\n", (int)(eq - kv), kv, eq + 1);
 						else
 							wprintf("    %s\n", kv);
 					}
+					if (site_details)
+						wprintf("    CUDA site diagnostics: %u missing/ambiguous (details: -v)\n", site_details);
 				}
 				if (has_extras) {
 					wprintf("%-*s\n", w, "Extras:");
@@ -2194,8 +2244,13 @@ int main(int argc, char **argv)
 						if (e->kind == WEXTRA_METADATA || e->kind == WEXTRA_STATS ||
 						    e->kind == WEXTRA_STACK_CAPTURE)
 							continue;
+						if (!env_verbose && has_cuda_metadata && e->kind == WEXTRA_UTRACE_DEF &&
+						    cuda_api_definition_pid(wevent_str(dump_hdr, e->stroff)) > 0)
+							continue;
 						wprintf("    %s\n", extra_param_str(dump_hdr, e));
 					}
+					if (!env_verbose && has_cuda_metadata && (err = print_cuda_replay_summary(dump_hdr)))
+						goto cleanup;
 				}
 			}
 
@@ -3128,6 +3183,7 @@ cleanup:
 	cleanup_workers(workers, worker_cnt);
 	cleanup_bpf(&bpf_state);
 	utrace_cleanup_mapped_files();
+	cuda_api_cleanup();
 	if (workdir_fd >= 0)
 		close(workdir_fd);
 	if (!env.keep_workdir && workdir_name[0])

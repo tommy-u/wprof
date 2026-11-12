@@ -630,3 +630,30 @@ available:
 Use `arg:*` to capture all detected arguments with their inferred types
 and names.
 
+## CUDA host API preset
+
+`-f cuda-api=PID` adds ordinary UTRACE probes to an explicit existing process.
+Repeat it to trace a deduplicated union of PIDs. Discovery is not supported.
+`-f cuda` continues to use CUPTI for host and GPU activity; the preset requests
+no CUDA injection and may be selected independently.
+
+The initial sites are `cuLaunchKernel`, `cuCtxSynchronize_v2`,
+`cuDeviceGetAttribute`, `cudaLaunchKernel`, `cudaDeviceSynchronize` and
+`cudaSetDevice` in the process's mapped driver/runtime libraries. Missing or
+ambiguous objects/symbols are reported. A later-loaded library needs a new capture.
+
+The preset creates `uspan` definitions on the `CUDA host API` thread track
+for native x86-64 targets using ordinary UTRACE attachment.
+
+`--stacks=utrace` captures original entry caller stacks through UTRACE.
+Span exits carry `arg:ret:s32/name(status)` for these six declared scalar returns.
+`--seal uprobe-args` disables generated status capture and reports that policy;
+names, timestamps, thread identity and permitted stacks remain available.
+Missing returns have no successful status or invented endpoint.
+
+Replay uses the generated UTRACE definitions and normal replay windows.
+`-RI` summarizes preset definitions; `-v` displays their full details.
+`-f no-cuda-api` hides the preset's `CUDA host API` track while leaving other
+UTRACE and CUPTI data available. NDJSON retains ordinary entry/exit/instant legs.
+Entries without observed returns remain open. Host observations provide no
+GPU execution or device flows.

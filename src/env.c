@@ -200,6 +200,7 @@ static const struct argp_option opts[] = {
 	/* event subset targeting */
 	{ "feature", 'f', "FEAT", 0,
 	  "Data capture feature selector. Supported: ipi, req[=PATH|PID|comm:GLOB], scx, cuda[=nv-smi|all|PID], "
+	  "cuda-api=PID (six-site UTRACE preset), "
 	  "py-stacks[=nv-smi|PID], py-trace[=nv-smi|PID], py-torch[=nv-smi|PID], "
 	  "softirq, hardirq, irq, wq, sched (on by default), wakeup (on by default), task-life (on by default). "
 	  "Request sub-features under -f req: req-ctxs, req-tasks, req-rpc (all on by default), "
@@ -610,6 +611,24 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			} else {
 				eprintf("Use -f req-pmu=ctxs|tasks|none or -f no-req-pmu to pick which request layer gets PMU accounting!\n");
 				return -EINVAL;
+			}
+		} else if (strcasecmp(arg, "cuda-api") == 0 || strncasecmp(arg, "cuda-api=", 9) == 0) {
+			if (val == FALSE && !arg[8]) {
+				env.cuda_api_enabled = false;
+				env.cuda_api_disabled = true;
+			} else {
+				long pid;
+				if (val == FALSE || arg[8] != '=' || !sv_as_long(sv_new(arg + 9), &pid) || pid <= 0 || pid > INT_MAX) {
+					eprintf("Use -f cuda-api=PID with a positive explicit PID; discovery is not supported!\n");
+					return -EINVAL;
+				}
+				bool present = false;
+				for (int i = 0; i < env.cuda_api_pid_cnt; i++)
+					present |= env.cuda_api_pids[i] == pid;
+				if (!present && (err = append_int(&env.cuda_api_pids, &env.cuda_api_pid_cnt, pid)))
+					return err;
+				env.cuda_api_enabled = true;
+				env.cuda_api_disabled = false;
 			}
 		} else if (strcasecmp(arg, "scx") == 0) {
 			env.capture_scx = val;

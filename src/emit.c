@@ -22,6 +22,7 @@
 #include "demangle.h"
 #include "requests.h"
 #include "utrace_cfg.h"
+#include "cuda_api.h"
 
 #include "json.h"
 
@@ -5698,6 +5699,10 @@ static int process_utrace(struct worker_state *w, const struct wevent *e)
 		return 0;
 
 	struct wprof_data_hdr *hdr = w->dump_hdr;
+	if (env.cuda_api_disabled && env.utrace_cfgs[e->utrace.utrace_id].settings.id &&
+	    !strcmp(env.utrace_cfgs[e->utrace.utrace_id].settings.id, CUDA_API_TRACK_NAME))
+		return 0;
+
 	struct wprof_task task = wevent_resolve_task(hdr, e->task_id);
 
 	if (!should_trace_task(&task))
