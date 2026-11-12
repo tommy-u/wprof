@@ -200,7 +200,7 @@ static const struct argp_option opts[] = {
 	/* event subset targeting */
 	{ "feature", 'f', "FEAT", 0,
 	  "Data capture feature selector. Supported: ipi, req[=PATH|PID|comm:GLOB], scx, cuda[=nv-smi|all|PID], "
-	  "cuda-api=PID (six-site UTRACE preset), "
+	  "cuda-api=PID (host API UTRACE preset), "
 	  "py-stacks[=nv-smi|PID], py-trace[=nv-smi|PID], py-torch[=nv-smi|PID], "
 	  "softirq, hardirq, irq, wq, sched (on by default), wakeup (on by default), task-life (on by default). "
 	  "Request sub-features under -f req: req-ctxs, req-tasks, req-rpc (all on by default), "

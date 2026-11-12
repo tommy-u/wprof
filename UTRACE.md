@@ -351,7 +351,8 @@ for each site's ordinary UTRACE configuration. The prepared entry and return
 program templates are loaded to check support before the main program load;
 unsupported templates use individual uprobes. If either multi link cannot
 attach, any link already created for that group is removed before retrying
-the group with individual probes. Ordinary manually specified probes keep their individual attachments.
+the group with individual probes. The CUDA preset uses this mapped attachment
+path; ordinary manually specified probes keep their individual attachments.
 
 Mapped file descriptors are shared by file identity and closed after
 attachment or on failure. Individual fallback can need perf-event and link
@@ -633,26 +634,53 @@ and names.
 ## CUDA host API preset
 
 `-f cuda-api=PID` adds ordinary UTRACE probes to an explicit existing process.
-Repeat it to trace a deduplicated union of PIDs. Discovery is not supported.
+Repeat it to trace a deduplicated union of PIDs. Disabling the feature with
+`-f no-cuda-api` retains that selection, as with the other CUDA selectors.
+Discovery is not supported.
 `-f cuda` continues to use CUPTI for host and GPU activity; the preset requests
 no CUDA injection and may be selected independently.
 
-The initial sites are `cuLaunchKernel`, `cuCtxSynchronize_v2`,
-`cuDeviceGetAttribute`, `cudaLaunchKernel`, `cudaDeviceSynchronize` and
-`cudaSetDevice` in the process's mapped driver/runtime libraries. Missing or
-ambiguous objects/symbols are reported. A later-loaded library needs a new capture.
+The checked-in catalog contains 1,127 public driver/runtime host API names,
+organized by API family: launches and graphs, memory and IPC, streams/events/synchronization,
+device/context management, modules/resources and queries. It includes declared
+ABI versions and per-thread default-stream variants from CUDA SDK 13.2 host
+headers. Installed libraries can expose only a subset; unavailable or ambiguous
+objects/symbols are reported in metadata. No CUDA SDK is needed to build wprof.
+A later-loaded library needs a new capture.
+
+Regenerate the checked-in catalog from SDK headers and retained contracts:
+
+```sh
+python3 test/gen_cuda_api_catalog.py --sdk /path/to/sdk/include \
+    --compiler-include /path/to/compiler/include --output src/cuda_api_sites.h
+```
+
+The preset omits frequent getter families filtered by wprof's CUPTI path,
+plus `cuCtxGetDevice`, including ABI and stream variants. Explicit UTRACE
+probes can still select them.
+
+The preset probes mapped `libcuda.so` and `libcudart.so` files. `nvcc` links
+the CUDA runtime statically by default, so a target without mapped
+`libcudart.so` has no runtime API portion available to this preset. The driver
+portion may still be available through mapped `libcuda.so`. Use
+`nvcc --cudart shared` when runtime API tracing is needed. Generic manual UTRACE
+probes may target symbols in an executable with `path:`.
 
 The preset creates `uspan` definitions on the `CUDA host API` thread track
-for native x86-64 targets using ordinary UTRACE attachment.
+for native x86-64 targets using the UTRACE attachment described above.
 
 `--stacks=utrace` captures original entry caller stacks through UTRACE.
-Span exits carry `arg:ret:s32/name(status)` for these six declared scalar returns.
+Functions declared to return `CUresult` or `cudaError_t` carry
+`arg:ret:s32/name(status)` on exit. Helpers such as `cudaGetErrorString`,
+`cudaGetErrorName` and `cudaCreateChannelDesc` produce spans without a status
+argument because their declared returns are not CUDA error codes.
 `--seal uprobe-args` disables generated status capture and reports that policy;
 names, timestamps, thread identity and permitted stacks remain available.
 Missing returns have no successful status or invented endpoint.
 
 Replay uses the generated UTRACE definitions and normal replay windows.
-`-RI` summarizes preset definitions; `-v` displays their full details.
+`-RI` shows a compact preset summary; add `-v` for generated definitions and
+detailed site diagnostics.
 `-f no-cuda-api` hides the preset's `CUDA host API` track while leaving other
 UTRACE and CUPTI data available. NDJSON retains ordinary entry/exit/instant legs.
 Entries without observed returns remain open. Host observations provide no
@@ -668,3 +696,6 @@ Ordinary user-written UTRACE definitions keep their existing behavior.
 Library resolution time
 and the UTRACE attachment interval are recorded in `cuda-api.*` metadata.
 
+The full catalog is not an execution coverage list: missing exports and
+untested operations remain distinct. SDK wrappers and application-side helpers
+can forward to different exported APIs; the trace reports the exports observed.

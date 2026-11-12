@@ -7,15 +7,7 @@
 #include "utrace.h"
 
 static const struct cuda_api_site sites[] = {
-	{"libcuda.so", "cuLaunchKernel", CUDA_API_STATUS_S32},
-	{"libcuda.so", "cuLaunchKernel_ptsz", CUDA_API_STATUS_S32},
-	{"libcuda.so", "cuCtxSynchronize_v2", CUDA_API_STATUS_S32},
-	{"libcuda.so", "cuCtxSynchronize", CUDA_API_STATUS_S32},
-	{"libcuda.so", "cuDeviceGetAttribute", CUDA_API_STATUS_S32},
-	{"libcudart.so", "cudaLaunchKernel", CUDA_API_STATUS_S32},
-	{"libcudart.so", "cudaLaunchKernel_ptsz", CUDA_API_STATUS_S32},
-	{"libcudart.so", "cudaDeviceSynchronize", CUDA_API_STATUS_S32},
-	{"libcudart.so", "cudaSetDevice", CUDA_API_STATUS_S32},
+#include "cuda_api_sites.h"
 };
 static const char *libraries[] = {"libcuda.so", "libcudart.so"};
 
