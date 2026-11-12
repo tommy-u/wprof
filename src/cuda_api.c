@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 /* Copyright (c) 2026 Meta Platforms, Inc. */
+#include "elf_utils.h"
 #include "cuda_api.h"
 #include "env.h"
 #include "strs.h"
@@ -7,9 +8,12 @@
 
 static const struct cuda_api_site sites[] = {
 	{"libcuda.so", "cuLaunchKernel", CUDA_API_STATUS_S32},
+	{"libcuda.so", "cuLaunchKernel_ptsz", CUDA_API_STATUS_S32},
 	{"libcuda.so", "cuCtxSynchronize_v2", CUDA_API_STATUS_S32},
+	{"libcuda.so", "cuCtxSynchronize", CUDA_API_STATUS_S32},
 	{"libcuda.so", "cuDeviceGetAttribute", CUDA_API_STATUS_S32},
 	{"libcudart.so", "cudaLaunchKernel", CUDA_API_STATUS_S32},
+	{"libcudart.so", "cudaLaunchKernel_ptsz", CUDA_API_STATUS_S32},
 	{"libcudart.so", "cudaDeviceSynchronize", CUDA_API_STATUS_S32},
 	{"libcudart.so", "cudaSetDevice", CUDA_API_STATUS_S32},
 };
@@ -23,8 +27,7 @@ static int outcome(int pid, const char *status, int err)
 
 static int prepare_target(int pid)
 {
-	int err = 0;
-	int count = 0;
+	int err = 0, count = 0;
 	for (int i = 0; i < ARRAY_SIZE(libraries); i++) {
 		char *path = NULL;
 		int fd = utrace_open_mapped_binary(pid, libraries[i], &path);
@@ -37,40 +40,66 @@ static int prepare_target(int pid)
 			continue;
 		}
 		struct sbuf def = sbuf_new();
+		char fd_path[64];
+		const char *names[ARRAY_SIZE(sites)];
+		const struct cuda_api_site *selected[ARRAY_SIZE(sites)];
+		struct elf_sym_result resolved[ARRAY_SIZE(sites)];
+		int total = 0, missing = 0;
+		bool shared_address = false;
 		for (int j = 0; j < ARRAY_SIZE(sites); j++) {
 			if (strcmp(sites[j].library, libraries[i]))
 				continue;
-			const char *name = sites[j].name;
+			names[total] = sites[j].name;
+			selected[total] = &sites[j];
+			total++;
+		}
+		u64 begin = ktime_now_ns();
+		snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+		err = elf_find_dynsyms(fd_path, STT_FUNC, names, total, resolved);
+		u64 resolve_ns = ktime_now_ns() - begin;
+		for (int j = 0; !err && j < total; j++) {
+			const struct cuda_api_site *site = selected[j];
+			if (resolved[j].err) {
+				missing++;
+				err = append_str(&env.metadata, &env.metadata_cnt,
+						 sfmt("cuda-api.site.%d.%s=missing_or_ambiguous,error:%d", pid, site->name, resolved[j].err));
+				continue;
+			}
+			for (int k = 0; k < j; k++) {
+				if (!resolved[k].err && resolved[k].offset == resolved[j].offset) {
+					shared_address = true;
+					vprintf("cuda-api: PID %d %s: %s and %s share file address %#lx\n",
+						pid, libraries[i], names[k], site->name, resolved[j].offset);
+					break;
+				}
+			}
 			int first = env.utrace_cfg_cnt;
-			const char *status = cuda_api_status_params(sites[j].status, env.seals & SEAL_UPROBE_ARGS);
 			sbuf_reset(&def);
 			sbuf_appendf(&def, "uspan:%s (pid:%d, path:%s%s%s) | id:\"%s\", scope:thread |",
-				     name, pid, path,
-				     env.requested_stack_traces & ST_UTRACE ? ", stack" : "",
-				     status, CUDA_API_TRACK_NAME);
+				     site->name, pid, path, env.requested_stack_traces & ST_UTRACE ? ", stack" : "",
+				     cuda_api_status_params(site->status, env.seals & SEAL_UPROBE_ARGS), CUDA_API_TRACK_NAME);
 			err = ucfg_parse(sbuf_str(&def));
 			if (!err)
 				err = ucfg_validate_seals(first);
 			if (!err)
-				err = utrace_bind_mapped_uprobe(&env.utrace_cfgs[first], fd);
-			if (err == -ENOENT || err == -ESRCH || err == -EEXIST) {
-				/* A missing/ambiguous symbol adds no probe; other available sites remain useful. */
-				env.utrace_cfg_cnt = first;
-				wprintf("cuda-api: PID %d site %s missing_or_ambiguous (%d)\n", pid, name, err);
-				err = append_str(&env.metadata, &env.metadata_cnt,
-						 sfmt("cuda-api.site.%d.%s=missing_or_ambiguous,error:%d", pid, name, err));
-			} else if (!err) {
-				count++;
-				wprintf("cuda-api: PID %d site %s prepared (%s)\n", pid, name, path);
-			}
+				err = utrace_bind_mapped_uprobe_offset(&env.utrace_cfgs[first], fd, resolved[j].offset);
 			if (err)
 				break;
+			count++;
+			vprintf("cuda-api: PID %d site %s prepared (%s)\n", pid, site->name, path);
 		}
 		sbuf_free(&def);
 		close(fd);
 		free(path);
 		if (err)
 			return err;
+		err = append_str(&env.metadata, &env.metadata_cnt,
+				 sfmt("cuda-api.library.%d.%s=sites:%d,missing:%d,resolve_ns:%llu", pid, libraries[i], total, missing, resolve_ns));
+		if (err)
+			return err;
+		wprintf("cuda-api: PID %d %s: %d sites, %d missing\n", pid, libraries[i], total, missing);
+		if (shared_address)
+			wprintf("cuda-api: PID %d %s: one call may appear under several names\n", pid, libraries[i]);
 	}
 	return outcome(pid, count ? "span_prepared" : "no_available_sites", 0);
 }
@@ -95,7 +124,7 @@ int cuda_api_setup(void)
 		return 0;
 	int err = append_str(&env.metadata, &env.metadata_cnt,
 			     sfmt("cuda-api.status=%s",
-				  env.seals & SEAL_UPROBE_ARGS ? "disabled_by_uprobe_args_seal" : "signed32_return"));
+				  env.seals & SEAL_UPROBE_ARGS ? "disabled_by_uprobe_args_seal" : "per_site_return_policy"));
 	if (err)
 		return err;
 	for (int i = 0; i < env.cuda_api_pid_cnt; i++) {

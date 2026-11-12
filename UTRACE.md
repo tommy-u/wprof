@@ -657,3 +657,14 @@ Replay uses the generated UTRACE definitions and normal replay windows.
 UTRACE and CUPTI data available. NDJSON retains ordinary entry/exit/instant legs.
 Entries without observed returns remain open. Host observations provide no
 GPU execution or device flows.
+
+The CUDA preset resolves exported names in one ELF lookup per mapped library.
+Missing names do not discard other available functions. Version and per-thread
+stream entry points remain distinct when they use different file offsets.
+Names sharing a file address generate independent probes, so one call can
+appear under several names. Setup warns about aliases; `-v` lists the names.
+This is additional observation data, not evidence that each alias was called.
+Ordinary user-written UTRACE definitions keep their existing behavior.
+Library resolution time
+and the UTRACE attachment interval are recorded in `cuda-api.*` metadata.
+

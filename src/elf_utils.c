@@ -149,7 +149,7 @@ static bool elf_dynsym_match(const struct elf_dynsym_hash *h, Elf *elf, size_t i
  * preferring the default version of versioned symbols.
  */
 static bool elf_dynsym_hash_lookup(const struct elf_dynsym_hash *h, Elf *elf,
-				   const char *name, int st_type, GElf_Sym *sym)
+				   const char *name, int st_type, GElf_Sym *sym, int *error)
 {
 	const unsigned char *p = (const unsigned char *)name;
 	const uint32_t *w = h->hash->d_buf;
@@ -157,6 +157,10 @@ static bool elf_dynsym_hash_lookup(const struct elf_dynsym_hash *h, Elf *elf,
 	bool found = false, hidden;
 	uint32_t hash = 5381;
 	GElf_Sym cand;
+	int priority = -1;
+	unsigned long selected_offset = 0;
+	if (error)
+		*error = -ENOENT;
 
 	for (; *p; p++)
 		hash = hash * 33 + *p;
@@ -190,11 +194,30 @@ static bool elf_dynsym_hash_lookup(const struct elf_dynsym_hash *h, Elf *elf,
 		uint32_t chain_hash = chain[idx - sym_idx];
 
 		if ((chain_hash | 1) == (hash | 1) &&
-		    elf_dynsym_match(h, elf, idx, name, st_type, &cand, &hidden)) {
-			*sym = cand;
-			found = true;
-			if (!hidden)
-				break;
+		    elf_dynsym_match(h, elf, idx, name, st_type, &cand, &hidden) &&
+		    (!error || GELF_ST_BIND(cand.st_info) == STB_GLOBAL || GELF_ST_BIND(cand.st_info) == STB_WEAK)) {
+			if (!error) {
+				*sym = cand;
+				found = true;
+				if (!hidden)
+					break;
+			} else {
+				GElf_Shdr sh;
+				Elf_Scn *section = elf_getscn(elf, cand.st_shndx);
+				if (section && gelf_getshdr(section, &sh)) {
+					int score = (hidden ? 0 : 2) + (GELF_ST_BIND(cand.st_info) == STB_WEAK ? 0 : 1);
+					unsigned long offset = cand.st_value - sh.sh_addr + sh.sh_offset;
+					if (score > priority) {
+						*sym = cand;
+						priority = score;
+						selected_offset = offset;
+						*error = 0;
+						found = true;
+					} else if (score == priority && offset != selected_offset) {
+						*error = -EEXIST;
+					}
+				}
+			}
 		}
 		if (chain_hash & 1)
 			break;
@@ -343,7 +366,7 @@ int elf_read_sym_value(const char *binary_path, const char *sym_name,
 	if (!has_dynsym_hash)
 		goto scan;
 
-	if (elf_dynsym_hash_lookup(&dh, elf_fd.elf, sym_name, st_type, &hsym) &&
+	if (elf_dynsym_hash_lookup(&dh, elf_fd.elf, sym_name, st_type, &hsym, NULL) &&
 	    elf_copy_sym_value(elf_fd.elf, &hsym, buf, buf_sz) == 0) {
 		elf_close(&elf_fd);
 		return 0;
@@ -383,7 +406,7 @@ bool elf_has_dynsym(const char *binary_path, const char *sym_name, int st_type)
 		return false;
 
 	if (elf_dynsym_hash_init(elf_fd.elf, &dh) == 0) {
-		found = elf_dynsym_hash_lookup(&dh, elf_fd.elf, sym_name, st_type, &hsym);
+		found = elf_dynsym_hash_lookup(&dh, elf_fd.elf, sym_name, st_type, &hsym, NULL);
 	} else {
 		wprof_for_each(elf_sym, sym, elf_fd.elf, binary_path, SHT_DYNSYM, st_type) {
 			if (strcmp(sym->name, sym_name) == 0) {
@@ -430,7 +453,7 @@ int elf_find_syms(const char *binary_path, int st_type,
 		GElf_Shdr sh;
 		GElf_Sym sym;
 
-		if (!elf_dynsym_hash_lookup(&dh, elf_fd.elf, syms[i], st_type, &sym))
+		if (!elf_dynsym_hash_lookup(&dh, elf_fd.elf, syms[i], st_type, &sym, NULL))
 			continue;
 		scn = elf_getscn(elf_fd.elf, sym.st_shndx);
 		if (!scn || !gelf_getshdr(scn, &sh))
@@ -477,6 +500,54 @@ scan:
 	elf_close(&elf_fd);
 
 	return cnt_done == cnt ? 0 : -ENOENT;
+}
+
+int elf_find_dynsyms(const char *binary_path, int st_type, const char **names, size_t cnt,
+		     struct elf_sym_result *results)
+{
+	struct elf_fd file;
+	struct elf_dynsym_hash hash;
+	int priority[cnt];
+	for (size_t i = 0; i < cnt; i++) {
+		results[i] = (struct elf_sym_result){.err = -ENOENT};
+		priority[i] = -1;
+	}
+	int err = elf_open(binary_path, &file);
+	if (err)
+		return err;
+	if (!elf_dynsym_hash_init(file.elf, &hash)) {
+		for (size_t i = 0; i < cnt; i++) {
+			GElf_Sym sym;
+			GElf_Shdr sh;
+			if (!elf_dynsym_hash_lookup(&hash, file.elf, names[i], st_type, &sym, &results[i].err) || results[i].err)
+				continue;
+			Elf_Scn *section = elf_getscn(file.elf, sym.st_shndx);
+			if (!section || !gelf_getshdr(section, &sh))
+				continue;
+			results[i] = (struct elf_sym_result){.offset = sym.st_value - sh.sh_addr + sh.sh_offset};
+		}
+	} else {
+		struct elf_sym *sym;
+		wprof_for_each(elf_sym, sym, file.elf, binary_path, SHT_DYNSYM, st_type) {
+			int bind = GELF_ST_BIND(sym->sym.st_info);
+			if (bind != STB_GLOBAL && bind != STB_WEAK)
+				continue;
+			int score = (sym->hidden ? 0 : 2) + (bind == STB_WEAK ? 0 : 1);
+			for (size_t i = 0; i < cnt; i++) {
+				if (strcmp(names[i], sym->name) || score < priority[i])
+					continue;
+				unsigned long offset = sym->sym.st_value - sym->sh.sh_addr + sym->sh.sh_offset;
+				if (score > priority[i]) {
+					results[i] = (struct elf_sym_result){.offset = offset};
+					priority[i] = score;
+				} else if (offset != results[i].offset) {
+					results[i].err = -EEXIST;
+				}
+			}
+		}
+	}
+	elf_close(&file);
+	return 0;
 }
 
 /*
@@ -542,7 +613,7 @@ int elf_resolve_syms(int pid, unsigned long vma_start, unsigned long vma_end,
 	for (int i = 0; i < cnt; i++) {
 		GElf_Sym sym;
 
-		if (!elf_dynsym_hash_lookup(&dh, ef.elf, syms[i], st_type, &sym))
+		if (!elf_dynsym_hash_lookup(&dh, ef.elf, syms[i], st_type, &sym, NULL))
 			continue;
 		st_values[i] = sym.st_value;
 		hashed[i] = true;

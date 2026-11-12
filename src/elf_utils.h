@@ -55,6 +55,15 @@ bool elf_has_sec(const char *binary_path, const char *sec_name);
 int elf_find_syms(const char *binary_path, int st_type,
 		  const char **syms, size_t cnt, unsigned long *file_offs);
 
+struct elf_sym_result {
+	unsigned long offset;
+	int err;
+};
+
+/* Resolve exported functions in one ELF open, retaining per-name missing/ambiguous results. */
+int elf_find_dynsyms(const char *binary_path, int st_type, const char **names, size_t cnt,
+		     struct elf_sym_result *results);
+
 int elf_resolve_syms(int pid, unsigned long vma_start, unsigned long vma_end,
 		     unsigned long vma_offset, int st_type,
 		     const char **syms, size_t cnt, unsigned long *addrs);
